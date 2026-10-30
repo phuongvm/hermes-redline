@@ -1,10 +1,11 @@
 // Redline — guided Markdown and source-code review in Hermes Desktop.
 // The directive opens a reviewable file for selected-text annotations, then sends a
 // batch of comments, questions, or change requests to the agent composer.
-// Persistence: <file><ext>.redline.json sidecar.
+// Persistence: a sidecar chosen by the backend (adjacent <file><ext>.redline.json, or centralized under
+// the Hermes home); the pane reads its location from the /annotations reply.
 
 import {
-  Badge, Button, Codicon, Input, MessageTextContent, STATUSBAR_AREAS,
+  Badge, Button, Codicon, Input, MessageTextContent, ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS,
   TRANSCRIPT_DIRECTIVE_AREA, Textarea, atom, host, queryClient, useQuery, useValue,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -400,7 +401,157 @@ const CSS = `
 .rl-chip{display:flex;align-items:center;gap:5px;border:0;background:none;cursor:pointer;font-size:11px;padding:0 4px;color:var(--ui-text-tertiary)}
 .rl-chip:hover{color:var(--ui-text-primary)}
 .rl-chip b{font-weight:600;color:var(--ui-accent)}
+.rl-tabs,.rl-threads{display:flex;gap:4px;flex-wrap:wrap;align-items:center;padding:8px 0 0}
+.rl-tab{border:1px solid var(--ui-stroke-secondary);background:none;border-radius:7px;padding:2px 9px;font-size:11px;color:var(--ui-text-tertiary);cursor:pointer}
+.rl-tab:hover{color:var(--ui-text-primary)}
+.rl-tab.on{color:var(--ui-text-primary);background:color-mix(in oklab,var(--ui-accent) 14%,transparent);border-color:var(--ui-accent)}
 `
+
+/** Last path segment of a Windows or POSIX path. */
+function fileBasename(path) {
+  const text = String(path || '')
+  return text.split(/[\\/]/).filter(Boolean).pop() || text
+}
+
+/**
+ * The files a ::redline directive names: `file`, then `file_1..file_N` in numeric order, then an
+ * optional JSON-array `files`. Unsupported extensions are dropped and duplicates keep first position.
+ */
+function parseBundleFiles(attrs) {
+  const source = attrs || {}
+  const wanted = []
+  const push = (value) => {
+    const text = String(value == null ? '' : value).trim()
+    if (text && (hasExt(text, MD_EXT) || hasExt(text, CODE_EXT)) && !wanted.includes(text)) wanted.push(text)
+  }
+  push(source.file)
+  Object.keys(source)
+    .map((key) => /^file_(\d+)$/.exec(key))
+    .filter((match) => match && Number(match[1]) >= 1)
+    .sort((a, b) => Number(a[1]) - Number(b[1]))
+    .forEach((match) => push(source[match[0]]))
+  if (source.files != null) {
+    let list = source.files
+    if (typeof list === 'string') {
+      try { list = JSON.parse(list) } catch (error) { list = [] }
+    }
+    if (Array.isArray(list)) list.forEach(push)
+  }
+  return wanted
+}
+
+const FENCE_OPEN = /^[ \t]{0,3}(`{3,}|~{3,})/
+
+/**
+ * Split Markdown into review blocks on blank lines, except inside a fenced code block: a blank line
+ * in a fence never ends the block, so the whole fence is one annotatable unit.
+ */
+function splitMarkdownBlocks(content) {
+  const blocks = []
+  let current = []
+  let fence = null
+  const flush = () => {
+    if (current.length) blocks.push(current.join('\n'))
+    current = []
+  }
+  String(content == null ? '' : content).split(/\r?\n/).forEach((line) => {
+    if (fence) {
+      current.push(line)
+      const closer = line.trim()
+      if (closer && closer.split('').every((ch) => ch === fence.char) && closer.length >= fence.size) fence = null
+      return
+    }
+    if (!line.trim()) {
+      flush()
+      return
+    }
+    const opened = FENCE_OPEN.exec(line)
+    if (opened && !(opened[1][0] === '`' && line.slice(opened[0].length).includes('`'))) {
+      fence = { char: opened[1][0], size: opened[1].length }
+    }
+    current.push(line)
+  })
+  flush()
+  return blocks
+}
+
+const MAX_RANGE_LINES = 200
+
+/** The line block (`data-rl-block` index) a range endpoint sits in, or -1 outside the document. */
+function blockIndexOf(docEl, node) {
+  if (!node) return -1
+  const el = node.nodeType === 3 ? node.parentElement : node
+  const blockEl = el && el.closest ? el.closest('[data-rl-block]') : null
+  if (!blockEl || (docEl.contains && !docEl.contains(blockEl))) return -1
+  const raw = blockEl.dataset ? blockEl.dataset.rlBlock : blockEl.getAttribute('data-rl-block')
+  const index = Number(raw)
+  return Number.isInteger(index) ? index : -1
+}
+
+/**
+ * A code selection as line anchors: first/last spanned line block (capped at 200 lines), 1-based
+ * line numbers and the quote (the selected text for one line, the joined source lines for a range).
+ */
+function codeSelectionFromRange(docEl, blocks, range) {
+  const from = blockIndexOf(docEl, range.startContainer)
+  if (from < 0) return null
+  let to = blockIndexOf(docEl, range.endContainer)
+  let endFound = to >= 0
+  if (!endFound) {
+    // Ending at the document level (past the last line) spans to the last line; outside it stays on one.
+    to = docEl.contains && docEl.contains(range.endContainer) ? Math.max(from, blocks.length - 1) : from
+  }
+  let lo = Math.min(from, to)
+  let hi = Math.max(from, to)
+  // A drag that ends at offset 0 of the next line has not selected anything on that line.
+  if (endFound && hi > lo && range.endOffset === 0 && to === hi) hi -= 1
+  hi = Math.min(lo + MAX_RANGE_LINES - 1, hi)
+  const selected = typeof range.toString === 'function' ? String(range.toString()).trim() : ''
+  const quote = lo === hi ? (selected || String(blocks[lo] || '').trim()) : blocks.slice(lo, hi + 1).join('\n')
+  return { block: lo, endBlock: hi, line: lo + 1, endLine: hi + 1, quote }
+}
+
+/** True for a code annotation that spans more than one line. */
+function isRangeItem(a) {
+  return !!a && Number.isInteger(a.block) && Number.isInteger(a.endBlock) && a.endBlock > a.block
+}
+
+/** Which chat a batch goes to: an explicit re-bind, else the focused chat (standalone) or the card's pin. */
+function resolveTargetSession({ pinnedSessionId, reboundSessionId, focusedSessionId, standalone } = {}) {
+  return reboundSessionId || (standalone ? focusedSessionId : pinnedSessionId) || ''
+}
+
+/** Annotations for a Threads filter. Drafts are work in progress, so no filter lists them. */
+function filterAnnotations(items, filter = 'all') {
+  const real = (Array.isArray(items) ? items : []).filter((a) => a && !a.draft)
+  return filter === 'all' || !filter ? real : real.filter((a) => a.status === filter)
+}
+
+/** The id `delta` steps from `currentId` in `ids`, wrapping at both ends; null for an empty list. */
+function stepThread(ids, currentId, delta) {
+  if (!ids || !ids.length) return null
+  const at = ids.indexOf(currentId)
+  if (at < 0) return delta < 0 ? ids[ids.length - 1] : ids[0]
+  return ids[(((at + delta) % ids.length) + ids.length) % ids.length]
+}
+
+// Last answer per resource, so a poll can ask "has this changed since mtimeNs?" and reuse the data.
+const POLL_CACHE = new Map()
+
+/**
+ * One poll of /doc or /annotations. Sends `since_mtime` once an answer is cached; an `unchanged`
+ * reply returns the cached data untouched, anything else replaces it. `onChange` fires when a
+ * cached resource turns out to have changed on disk.
+ */
+async function pollConditional(ctx, cache, key, url, onChange) {
+  const prev = cache.get(key)
+  const useSince = prev && Number.isFinite(prev.mtimeNs)
+  const res = await ctx.rest(useSince ? `${url}${url.includes('?') ? '&' : '?'}since_mtime=${prev.mtimeNs}` : url)
+  if (res && res.unchanged && prev) return prev.data
+  if (res && Number.isFinite(res.mtimeNs)) cache.set(key, { mtimeNs: res.mtimeNs, data: res })
+  if (prev && onChange) onChange()
+  return res
+}
 
 // Tokens come lexed from the backend (Pygments) as a flat [class, text] list
 // covering the whole file, newlines included; we split them back into lines so
@@ -419,11 +570,15 @@ function tokensToLines(tokens) {
   return lines
 }
 
-export function buildBatchMessage(path, items) {
-  const head = `⁂ redline — review of ${path} (${items.length} notes). Change requests: edit ${path} in place — do not create a new copy or file.`
+export function buildBatchMessage(path, items, sidecarPath = '') {
+  const slash = (value) => String(value).split(String.fromCharCode(92)).join('/')
+  const sidecar = sidecarPath && slash(sidecarPath) !== slash(`${path}.redline.json`)
+    ? ` Resolve status in sidecar: ${sidecarPath}.` : ''
+  const head = `⁂ redline — review of ${path} (${items.length} notes). Change requests: edit ${path} in place — do not create a new copy or file.${sidecar}`
   const body = items.map((a, i) => {
     const k = KINDS[a.kind] || KINDS.comment
-    const quote = a.line ? `L${a.line}: ${a.quote}` : a.quote
+    const ranged = a.line && a.endLine && a.endLine > a.line
+    const quote = ranged ? `L${a.line}-L${a.endLine}: ${a.quote}` : (a.line ? `L${a.line}: ${a.quote}` : a.quote)
     return `${i + 1}. [${k.label}] selection: "${quote}"\n   → ${a.note}`
   })
   return [head, ...body].join('\n')
@@ -474,43 +629,83 @@ function Card({ a, draftText, onDraftText, onSaveDraft, onSend, onCancelDraft, o
   ] })
 }
 
-function RedlinePane({ ctx, file, targetSessionId }) {
-  const [path, setPath] = useState(file || '')
-  const [active, setActive] = useState(file || '')
+function currentFocusedSessionId() {
+  try {
+    const atomRef = host.state && host.state.focusedSessionId
+    const value = atomRef ? atomRef.get() : ''
+    return value ? String(value) : ''
+  } catch (error) {
+    return ''
+  }
+}
+
+const FILTERS = [['all', 'All'], ['open', 'Open'], ['sent', 'Sent'], ['resolved', 'Resolved']]
+
+function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
+  const bundle = Array.isArray(files) && files.length ? files : (file ? [file] : [])
+  const first = bundle[0] || ''
+  const [path, setPath] = useState(first)
+  const [active, setActive] = useState(first)
   const [draftText, setDraftText] = useState('')
   const [pill, setPill] = useState(null)
   const [shown, setShown] = useState(null)
   const [marks, setMarks] = useState({})
+  const [rebound, setRebound] = useState('')
+  const [filter, setFilter] = useState('all')
+  const [updated, setUpdated] = useState(false)
   const measureRef = useRef(null)
   const docRef = useRef(null)
   const mainRef = useRef(null)
 
   const docQ = useQuery({
     queryKey: ['redline:doc', active],
-    queryFn: () => ctx.rest(`/doc?path=${encodeURIComponent(active)}`),
-    enabled: !!active, retry: false, refetchInterval: 3000, // ponytail: 3-second polling; upgrade to SSE if latency matters
+    queryFn: () => pollConditional(ctx, POLL_CACHE, `doc:${active}`, `/doc?path=${encodeURIComponent(active)}`, () => setUpdated(true)),
+    enabled: !!active, retry: false, refetchInterval: 3000, // ponytail: 3-second polling; since_mtime keeps an idle poll to one stat call
   })
   const annQ = useQuery({
     queryKey: ['redline:ann', active],
-    queryFn: () => ctx.rest(`/annotations?path=${encodeURIComponent(active)}`),
+    queryFn: () => pollConditional(ctx, POLL_CACHE, `ann:${active}`, `/annotations?path=${encodeURIComponent(active)}`),
     enabled: !!active, retry: false, refetchInterval: 3000,
+  })
+  const recentQ = useQuery({
+    queryKey: ['redline:recent'],
+    queryFn: () => ctx.rest('/recent?limit=8'),
+    enabled: !!standalone && !active, retry: false, refetchInterval: 5000,
   })
 
   const items = (annQ.data && annQ.data.items) || []
+  const sidecarPath = (annQ.data && annQ.data.sidecarPath) || ''
   const open = items.filter((a) => a.status === 'open')
+  const filtered = filterAnnotations(items, filter)
+  const visible = items.filter((a) => a.draft || filtered.includes(a))
+  const unresolved = items.filter((a) => !a.draft && a.status !== 'resolved')
+  const centralRecent = (recentQ.data && recentQ.data.items) || []
   useEffect(() => {
     $openCount.set(open.length)
     return () => $openCount.set(0)
   }, [open.length])
+  useEffect(() => {
+    if (!updated) return undefined
+    const timer = setTimeout(() => setUpdated(false), 4000)
+    return () => clearTimeout(timer)
+  }, [updated])
 
   const isCode = active && hasExt(active, CODE_EXT)
   const tokLines = isCode && docQ.data && docQ.data.tokens && docQ.data.tokens.length
     ? tokensToLines(docQ.data.tokens) : null
-  const blocks = !active || !docQ.data ? [] : (isCode
+  const blocks = !active || !docQ.data || typeof docQ.data.content !== 'string' ? [] : (isCode
     ? docQ.data.content.split('\n')
-    : docQ.data.content.split(/\n[ \t]*\n/))
+    : splitMarkdownBlocks(docQ.data.content))
 
-  useEffect(() => { if (file) { setActive(file); setPath(file) } }, [file])
+  useEffect(() => { if (first) { setActive(first); setPath(first) } }, [first])
+
+  const switchTo = (next) => {
+    setActive(next)
+    setPath(next)
+    setShown(null)
+    setPill(null)
+    setUpdated(false)
+  }
 
   // Threads are anchored to the rendered text, because the pane renders Markdown: the stored quote has
   // to be located in the DOM, not in the source. Measured after each render (the pane polls every 3s,
@@ -522,6 +717,29 @@ function RedlinePane({ ctx, file, targetSessionId }) {
     const texts = blockEls.map((el) => blockText(el))
     const next = {}
     items.forEach((a) => {
+      if (isRangeItem(a)) {
+        // A multi-line code selection is anchored by line numbers: wash every spanned line whole.
+        const head = blockEls[a.block]
+        if (!head) return
+        const baseRect = head.getBoundingClientRect()
+        const boxes = []
+        for (let b = a.block; b <= Math.min(a.endBlock, blockEls.length - 1); b += 1) {
+          const text = texts[b]
+          const range = text ? rangeIn(blockEls[b], { start: 0, end: text.length }) : null
+          if (!range) continue
+          Array.from(range.getClientRects())
+            .filter((rect) => rect.width > 0 && rect.height > 0)
+            .forEach((rect) => boxes.push({
+              left: quantise(rect.left - baseRect.left),
+              top: quantise(rect.top - baseRect.top),
+              width: quantise(rect.width),
+              height: quantise(rect.height),
+            }))
+        }
+        const rows = mergeBoxes(boxes)
+        if (rows.length) next[a.id] = { block: a.block, top: quantise(rows[0].top - 1), boxes: rows }
+        return
+      }
       // The block is resolved, not assumed: a paragraph added or removed above this thread shifts the
       // recorded index, and the passage is usually still there a block or two away.
       const resolved = resolveBlock(texts, a.block, a)
@@ -557,9 +775,20 @@ function RedlinePane({ ctx, file, targetSessionId }) {
   }, [])
 
   const save = (next) => {
+    const key = ['redline:ann', active]
     ctx.rest('/annotations', { method: 'POST', body: { path: active, items: next } })
-      .then(() => {
-        queryClient.setQueryData(['redline:ann', active], { items: next }) // Update the cache so the annotation appears immediately.
+      .then((res) => {
+        const previous = annQ.data || {}
+        const saved = res && typeof res === 'object' ? res : {}
+        const merged = {
+          ...previous, unchanged: false, items: next,
+          sidecarPath: saved.sidecarPath || previous.sidecarPath,
+          storage: saved.storage || previous.storage,
+          mtimeNs: Number.isFinite(saved.mtimeNs) ? saved.mtimeNs : previous.mtimeNs,
+        }
+        // Update the cache so the annotation appears immediately and the next poll is a cheap no-change.
+        queryClient.setQueryData(key, merged)
+        if (Number.isFinite(merged.mtimeNs)) POLL_CACHE.set(`ann:${active}`, { mtimeNs: merged.mtimeNs, data: merged })
         host.notify({ kind: 'info', message: `redline: saved ${next.length} annotations` })
       })
       .catch(() => host.notifyError('redline backend unavailable — enable the redline plugin (Capabilities → Plugins) and restart the gateway'))
@@ -580,6 +809,36 @@ function RedlinePane({ ctx, file, targetSessionId }) {
       : { ...a, status: 'resolved', closed_by: 'reviewer' }
   }))
   const remove = (id) => save(items.filter((a) => a.id !== id))
+  const resolveAll = () => {
+    if (!unresolved.length) return
+    save(items.map((a) => (a.draft || a.status === 'resolved' ? a : { ...a, status: 'resolved', closed_by: 'reviewer' })))
+    setShown(null)
+  }
+  const jump = (delta) => {
+    const id = stepThread(filtered.map((a) => a.id), shown, delta)
+    if (!id) return
+    setShown(id)
+    const target = items.find((a) => a.id === id)
+    const block = marks[id] ? marks[id].block : (target ? target.block : 0)
+    const el = docRef.current && docRef.current.querySelector(`[data-rl-block="${block}"]`)
+    if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center' })
+  }
+
+  const bindToActiveChat = () => {
+    const focused = currentFocusedSessionId()
+    if (!focused) {
+      host.notifyError('redline: no active chat to bind to; open a chat first')
+      return
+    }
+    setRebound(focused)
+    host.notify({ kind: 'info', message: 'redline: bound to the active chat' })
+  }
+  const deliveryTarget = () => resolveTargetSession({
+    pinnedSessionId: targetSessionId,
+    reboundSessionId: rebound,
+    focusedSessionId: standalone ? currentFocusedSessionId() : '',
+    standalone: !!standalone,
+  })
 
   const onMouseUp = () => {
     const sel = window.getSelection()
@@ -591,10 +850,19 @@ function RedlinePane({ ctx, file, targetSessionId }) {
     if (node && node.nodeType === 3) node = node.parentElement
     const blockEl = node && node.closest ? node.closest('[data-rl-block]') : null
     if (!blockEl) { setPill(null); return }
-    const span = selectionSpan(blockEl, range)
-    if (!span) { setPill(null); return }
     const r = range.getBoundingClientRect()
     const mb = mainRef.current.getBoundingClientRect()
+    const x = Math.max(0, Math.min(r.left - mb.left, mb.width - 260))
+    const y = r.bottom - mb.top + 8
+    if (isCode) {
+      const spanned = codeSelectionFromRange(docRef.current, blocks, range)
+      if (spanned && spanned.endBlock > spanned.block) {
+        setPill({ ...spanned, x, y })
+        return
+      }
+    }
+    const span = selectionSpan(blockEl, range)
+    if (!span) { setPill(null); return }
     setPill({
       block: Number(blockEl.dataset.rlBlock),
       // The rendered text of the selection, measured in the DOM: no markdown, no truncation, and the
@@ -602,15 +870,19 @@ function RedlinePane({ ctx, file, targetSessionId }) {
       quote: blockText(blockEl).slice(span.start, span.end).trim(),
       start: span.start,
       end: span.end,
-      x: Math.max(0, Math.min(r.left - mb.left, mb.width - 260)),
-      y: r.bottom - mb.top + 8,
+      x,
+      y,
     })
   }
   const openKind = (kind) => {
     if (!pill) return
     const id = `a${Date.now()}`
     const line = isCode ? pill.block + 1 : undefined
-    save([...items, { id, kind, block: pill.block, quote: pill.quote, start: pill.start, end: pill.end, note: '', status: 'open', draft: true, line }])
+    const multi = isCode && Number.isInteger(pill.endBlock) && pill.endBlock > pill.block
+    const anchor = multi
+      ? { endBlock: pill.endBlock, endLine: pill.endBlock + 1 }
+      : { start: pill.start, end: pill.end, ...(isCode ? { endLine: line } : {}) }
+    save([...items, { id, kind, block: pill.block, ...anchor, quote: pill.quote, note: '', status: 'open', draft: true, line }])
     setShown(id)
     setDraftText('')
     setPill(null)
@@ -619,14 +891,15 @@ function RedlinePane({ ctx, file, targetSessionId }) {
 
   const sendBatch = () => {
     if (!open.length) return
-    if (!submitToTarget(targetSessionId, buildBatchMessage(active, open))) return
+    if (!submitToTarget(deliveryTarget(), buildBatchMessage(active, open, sidecarPath), !!standalone)) return
     save(items.map((a) => (a.status === 'open' ? { ...a, status: 'sent' } : a)))
     host.notify({ kind: 'info', message: `redline: ${open.length} annotations sent to Hermes` })
   }
   const sendOne = (id, note) => {
     const a = items.find((x) => x.id === id)
     if (!a) return
-    if (!submitToTarget(targetSessionId, buildBatchMessage(active, [{ ...a, note: note.trim(), draft: undefined }]))) return
+    const message = buildBatchMessage(active, [{ ...a, note: note.trim(), draft: undefined }], sidecarPath)
+    if (!submitToTarget(deliveryTarget(), message, !!standalone)) return
     save(items.map((x) => (x.id === id ? { ...x, note: note.trim(), draft: undefined, status: 'sent' } : x)))
     setShown(null)
     setDraftText('')
@@ -636,7 +909,7 @@ function RedlinePane({ ctx, file, targetSessionId }) {
   const load = () => {
     const p = path.trim()
     if (!p) return
-    setActive(p)
+    switchTo(p)
     const recent = (ctx.storage.get('recent') || []).filter((x) => x !== p)
     ctx.storage.set('recent', [p, ...recent].slice(0, 6))
   }
@@ -648,52 +921,75 @@ function RedlinePane({ ctx, file, targetSessionId }) {
       active ? jsx('span', { className: 'rl-path', title: active, children: active }) : null,
       jsx(Input, { value: path, placeholder: 'File path (Markdown or code)', className: 'w-64', onChange: (e) => setPath(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') load() } }),
       jsx(Button, { size: 'sm', variant: 'outline', onClick: load, children: 'open' }),
-      recent.length ? jsx('span', { style: { display: 'flex', gap: 4, flexWrap: 'wrap' }, children: recent.map((r) => jsx(Button, { size: 'sm', variant: 'ghost', className: 'rl-chip', onClick: () => { setActive(r); setPath(r) } }, r.split('/').pop())) }) : null,
+      recent.length ? jsx('span', { style: { display: 'flex', gap: 4, flexWrap: 'wrap' }, children: recent.map((r) => jsx(Button, { size: 'sm', variant: 'ghost', className: 'rl-chip', onClick: () => switchTo(r) }, fileBasename(r))) }) : null,
       jsx('span', { style: { marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }, children: [
+        updated ? jsx(Badge, { variant: 'outline', children: 'Updated' }) : null,
+        !standalone ? jsx(Button, { size: 'sm', variant: 'ghost', title: 'Send this review to the chat that is open now', onClick: bindToActiveChat, children: 'Bind to active chat' }) : null,
+        rebound ? jsx(Badge, { variant: 'outline', children: 'bound to active chat' }) : null,
         open.length ? jsx(Badge, { variant: 'outline', children: `${open.length} open` }) : null,
         jsx(Button, { size: 'sm', disabled: !open.length, onClick: sendBatch, children: `Send ${open.length || ''} to Hermes` }),
       ] }),
     ] }),
+    bundle.length > 1 ? jsx('div', { className: 'rl-tabs', children: bundle.map((f) => jsx('button', {
+      type: 'button', className: `rl-tab${f === active ? ' on' : ''}`, title: f, onClick: () => switchTo(f), children: fileBasename(f),
+    }, f)) }) : null,
+    items.length ? jsxs('div', { className: 'rl-threads', children: [
+      jsx('span', { className: 'rl-mini', children: 'Threads' }),
+      ...FILTERS.map(([id, label]) => jsx('button', {
+        type: 'button', className: `rl-tab${filter === id ? ' on' : ''}`, onClick: () => setFilter(id), children: label,
+      }, id)),
+      jsx(Button, { size: 'sm', variant: 'ghost', disabled: !filtered.length, onClick: () => jump(-1), children: 'Prev' }),
+      jsx(Button, { size: 'sm', variant: 'ghost', disabled: !filtered.length, onClick: () => jump(1), children: 'Next' }),
+      jsx(Button, { size: 'sm', variant: 'ghost', disabled: !unresolved.length, onClick: resolveAll, children: 'Resolve all' }),
+    ] }) : null,
     jsxs('div', { className: 'rl-main', ref: mainRef, children: [
       jsx('div', {
         ref: docRef, className: 'rl-doc', onMouseUp: onMouseUp,
-        children: docQ.isPending && active
-          ? jsx('div', { className: 'rl-empty', children: 'loading…' })
-          : docQ.isError
-            ? jsx('div', { className: 'rl-empty', children: `could not read ${active} — check the path (the redline backend must be active)` })
-            : blocks.map((b, i) => {
-              const blockItems = items.filter((a) => (marks[a.id] ? marks[a.id].block : a.block) === i)
-              const tops = blockMarkerTops(blockItems, marks)
-              return jsxs('div', { 'data-rl-block': String(i), className: 'rl-block', children: [
-                jsx('div', { className: 'rl-hl', children: blockItems.flatMap((a) => {
-                  const k = KINDS[a.kind] || KINDS.comment
-                  return washBoxes(a, marks[a.id]).map((box, line) => jsx('i', {
-                    className: a.status === 'sent' ? 'sent' : '',
-                    style: {
-                      '--rl-line': `var(${k.var})`, '--rl-soft': `var(${k.var}-soft)`,
-                      left: box.left, top: box.top, width: box.width, height: box.height,
-                    },
-                  }, `${a.id}-${line}`))
-                }) }),
-                isCode
-                  ? jsxs('div', { className: 'rl-line', children: [
-                      jsx('span', { className: 'rl-ln', children: String(i + 1) }),
-                      jsx('span', { className: 'rl-code', children: (tokLines && tokLines[i]) || b || ' ' }),
-                    ] })
-                  : jsx(MessageTextContent, { text: b, media: false }),
-                ...blockItems.map((a) => {
-                  const k = KINDS[a.kind] || KINDS.comment
-                  const row = tops.find((marker) => marker.id === a.id)
-                  return jsx('button', {
-                    type: 'button', className: `rl-marker${a.status === 'resolved' ? ' done' : ''}`,
-                    style: { '--rl-line': `var(${k.var})`, '--rl-soft': `var(${k.var}-soft)`, top: row ? row.top : MARKER_TOP },
-                    title: a.quote || a.note || k.label,
-                    onClick: () => setShown(shown === a.id ? null : a.id),
-                    children: markerGlyph(a),
-                  }, a.id)
-                }),
-              ] }, String(i))
-            }) || null,
+        children: !active
+          ? jsx('div', { className: 'rl-empty', children: centralRecent.length ? [
+              jsx('div', { className: 'rl-mini', children: 'Recently annotated' }),
+              ...centralRecent.map((r) => jsx('button', {
+                type: 'button', className: 'rl-tab', title: r.path, onClick: () => switchTo(r.path),
+                children: `${fileBasename(r.path)} · ${r.openCount} open`,
+              }, r.sidecarPath || r.path)),
+            ] : 'Enter a file path above to start a review.' })
+          : docQ.isPending
+            ? jsx('div', { className: 'rl-empty', children: 'loading…' })
+            : docQ.isError
+              ? jsx('div', { className: 'rl-empty', children: `could not read ${active} — check the path (the redline backend must be active)` })
+              : blocks.map((b, i) => {
+                const blockItems = visible.filter((a) => (marks[a.id] ? marks[a.id].block : a.block) === i)
+                const tops = blockMarkerTops(blockItems, marks)
+                return jsxs('div', { 'data-rl-block': String(i), className: 'rl-block', children: [
+                  jsx('div', { className: 'rl-hl', children: blockItems.flatMap((a) => {
+                    const k = KINDS[a.kind] || KINDS.comment
+                    return washBoxes(a, marks[a.id]).map((box, line) => jsx('i', {
+                      className: a.status === 'sent' ? 'sent' : '',
+                      style: {
+                        '--rl-line': `var(${k.var})`, '--rl-soft': `var(${k.var}-soft)`,
+                        left: box.left, top: box.top, width: box.width, height: box.height,
+                      },
+                    }, `${a.id}-${line}`))
+                  }) }),
+                  isCode
+                    ? jsxs('div', { className: 'rl-line', children: [
+                        jsx('span', { className: 'rl-ln', children: String(i + 1) }),
+                        jsx('span', { className: 'rl-code', children: (tokLines && tokLines[i]) || b || ' ' }),
+                      ] })
+                    : jsx(MessageTextContent, { text: b, media: false }),
+                  ...blockItems.map((a) => {
+                    const k = KINDS[a.kind] || KINDS.comment
+                    const row = tops.find((marker) => marker.id === a.id)
+                    return jsx('button', {
+                      type: 'button', className: `rl-marker${a.status === 'resolved' ? ' done' : ''}`,
+                      style: { '--rl-line': `var(${k.var})`, '--rl-soft': `var(${k.var}-soft)`, top: row ? row.top : MARKER_TOP },
+                      title: a.quote || a.note || k.label,
+                      onClick: () => setShown(shown === a.id ? null : a.id),
+                      children: markerGlyph(a),
+                    }, a.id)
+                  }),
+                ] }, String(i))
+              }) || null,
       }),
       shown ? (() => {
         const a = items.find((x) => x.id === shown)
@@ -725,9 +1021,11 @@ function RedlinePane({ ctx, file, targetSessionId }) {
   ] })
 }
 
-function submitToTarget(targetSessionId, message) {
+function submitToTarget(targetSessionId, message, standalone = false) {
   if (!targetSessionId) {
-    host.notifyError('redline: this pane is detached; reopen it from a Redline card in the target chat')
+    host.notifyError(standalone
+      ? 'redline: no active chat to send to; open a chat and try again — annotations remain unsent'
+      : 'redline: this pane is detached; reopen it from a Redline card in the target chat')
     return false
   }
   if (!host.composer.submit(targetSessionId, message)) {
@@ -737,12 +1035,21 @@ function submitToTarget(targetSessionId, message) {
   return true
 }
 
-function Chip() {
+function openStandalone(ctx) {
+  host.openWorkspace('redline', {
+    title: 'redline',
+    dock: { pane: 'workspace', pos: 'right' },
+    minWidth: '420px',
+    render: () => jsx(RedlinePane, { ctx, standalone: true }, 'standalone'),
+  })
+}
+
+function Chip({ ctx }) {
   const n = useValue($openCount)
-  if (!n) return null
-  return jsxs('span', {
-    className: 'rl-chip', title: 'open redline annotations',
-    children: [jsx(Codicon, { name: 'tag', className: 'text-(--ui-accent)' }), jsx('b', { children: String(n) })],
+  return jsxs('button', {
+    type: 'button', className: 'rl-chip', title: n ? 'open redline annotations — open Redline' : 'open Redline',
+    onClick: () => openStandalone(ctx),
+    children: [jsx(Codicon, { name: 'tag', className: 'text-(--ui-accent)' }), n ? jsx('b', { children: String(n) }) : null],
   })
 }
 
@@ -754,7 +1061,10 @@ function Chip() {
 export const internals = {
   locateQuote, spanFromPoints, spanForAnnotation, resolveBlock, stackPositions, mergeBoxes, quantise, sameMarks,
   washBoxes, markerGlyph, resolutionLine, blockMarkerTops, textNodesOf, selectionSpan, rangeIn, submitToTarget,
+  fileBasename, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
+  resolveTargetSession, filterAnnotations, stepThread, pollConditional, MD_EXT, CODE_EXT,
 }
+export const __test = internals
 
 export default {
   id: 'redline',
@@ -766,26 +1076,40 @@ export default {
     ctx.onDispose(() => style.remove())
 
     ctx.registerMany([
-      { id: 'chip', area: STATUSBAR_AREAS.right, order: 130, render: () => jsx(Chip, {}) },
+      { id: 'chip', area: STATUSBAR_AREAS.right, order: 130, render: () => jsx(Chip, { ctx }) },
+      {
+        id: 'page',
+        area: ROUTES_AREA,
+        data: { path: '/redline' },
+        render: () => jsx(RedlinePane, { ctx, standalone: true }, 'standalone'),
+      },
+      {
+        id: 'nav',
+        area: SIDEBAR_NAV_AREA,
+        order: 60,
+        data: { codicon: 'comment-discussion', label: 'Redline', path: '/redline', asTile: true },
+      },
       {
         id: 'directive',
         area: TRANSCRIPT_DIRECTIVE_AREA,
         data: {
-          name: 'redline', // The agent writes ::redline{file="/path/to/reviewable-file"}
+          name: 'redline', // The agent writes ::redline{file="/path/to/file", file_1="/path/to/other"}
           render: ({ attrs, sessionId }) => {
-            const file = String(attrs.file || '').trim()
-            if (!file || !(hasExt(file, MD_EXT) || hasExt(file, CODE_EXT))) return null
+            const bundleFiles = parseBundleFiles(attrs || {})
+            if (!bundleFiles.length) return null
+            const lead = bundleFiles[0]
             return jsxs('div', {
               className: 'rl-card', style: { '--rl-line': 'var(--ui-red)', maxWidth: 460 }, children: [
                 jsxs('div', { className: 'rl-kind', children: [jsx('span', { className: 'rl-asterisk', children: '⁂' }), 'guided review'] }),
-                jsx('div', { className: 'rl-note', children: file }),
+                jsx('div', { className: 'rl-note', children: lead }),
+                bundleFiles.length > 1 ? jsx('div', { className: 'rl-path', children: `+${bundleFiles.length - 1} more` }) : null,
                 jsx('div', { className: 'rl-foot', children: jsx(Button, {
                   size: 'sm',
                   onClick: () => host.openWorkspace('redline', {
                     title: 'redline',
                     dock: { pane: 'workspace', pos: 'right' },
                     minWidth: '420px',
-                    render: () => jsx(RedlinePane, { ctx, file, targetSessionId: sessionId }, `${file}:${sessionId || ''}`),
+                    render: () => jsx(RedlinePane, { ctx, file: lead, files: bundleFiles, targetSessionId: sessionId }, `${bundleFiles.join('|')}:${sessionId || ''}`),
                   }),
                   children: 'Review in Redline',
                 }) }),

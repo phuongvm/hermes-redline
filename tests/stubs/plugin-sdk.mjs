@@ -16,6 +16,8 @@ export function __reset() {
 }
 
 export const STATUSBAR_AREAS = { right: 'statusbar.right' }
+export const ROUTES_AREA = 'routes'
+export const SIDEBAR_NAV_AREA = 'sidebar.nav'
 export const TRANSCRIPT_DIRECTIVE_AREA = 'transcript.directive'
 
 export const Badge = function Badge() {}

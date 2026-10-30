@@ -3,10 +3,15 @@
 Mounted at /api/plugins/redline/ when the dashboard plugin is discovered.
 Code files are lexed with Pygments (already in the gateway venv) into a flat
 token list the desktop pane renders; any lexer failure degrades to plain text.
+
+Extension sets, sidecar resolution and sidecar I/O live in ``redline_common`` (stdlib only).
+``GET /doc`` and ``GET /annotations`` accept ``since_mtime`` (the ``mtimeNs`` of a previous
+answer) and short-circuit to ``unchanged: true`` without reading or lexing anything.
 """
+import importlib.util
 import json
 import os
-import tempfile
+import sys
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,13 +27,28 @@ except ImportError:
     lex = TextLexer = get_lexer_for_filename = None
     ClassNotFound = Exception
 
+
+def _load_common():
+    """Load redline_common.py from the plugin root (this file lives in dashboard/)."""
+    existing = sys.modules.get("redline_common")
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().parent.parent / "redline_common.py"
+    spec = importlib.util.spec_from_file_location("redline_common", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("redline_common.py not found beside the plugin")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("redline_common", module)
+    spec.loader.exec_module(module)
+    return sys.modules["redline_common"]
+
+
+common = _load_common()
+
 router = APIRouter()
 
 MAX_BYTES = 1_000_000
 MAX_TOKENS = 200_000
-_MD_EXT = {".md", ".markdown"}
-_CODE_EXT = (".py", ".sh", ".js", ".ts", ".tsx", ".c", ".h", ".cpp", ".go", ".rs", ".rb",
-             ".yaml", ".yml", ".json", ".toml", ".sql")
 
 # Pygments token dotted name -> redline CSS class; walk prefixes so
 # Token.Keyword.Constant -> Keyword, Token.Name.Function -> Name.Function.
@@ -77,7 +97,7 @@ def _resolve(path: str) -> Path:
         p = Path(os.path.expanduser(str(path).strip())).resolve(strict=True)
     except OSError as exc:
         raise HTTPException(404, f"file not found: {path}") from exc
-    if p.suffix.lower() not in (_MD_EXT | set(_CODE_EXT)):
+    if p.suffix.lower() not in (common.MD_EXT + common.CODE_EXT):
         raise HTTPException(400, "redline reads Markdown and source files only")
     if not p.is_file():
         raise HTTPException(404, f"not a file: {p}")
@@ -86,48 +106,40 @@ def _resolve(path: str) -> Path:
     return p
 
 
-def _sidecar(p: Path) -> Path:
-    return p.with_suffix(p.suffix + ".redline.json")
-
-
-def _read_sidecar(sc: Path) -> list:
+def _read_items(sc: Path) -> list:
     try:
-        items = json.loads(sc.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(500, f"sidecar is not valid JSON: {sc}") from exc
-    if not isinstance(items, list):
-        raise HTTPException(500, f"sidecar must contain a JSON list: {sc}")
-    return items
+        return common.read_sidecar_items(sc)
+    except ValueError as exc:
+        raise HTTPException(500, str(exc)) from exc
 
 
-def _write_sidecar(sc: Path, items: list) -> None:
-    payload = json.dumps(items, ensure_ascii=False, indent=2)
-    # ponytail: replace is atomic on one filesystem; add locking only if concurrent editors matter.
-    fd, temp_path = tempfile.mkstemp(prefix=f".{sc.name}.", suffix=".tmp", dir=sc.parent, text=True)
+def _mtime_ns(path: Path) -> int:
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        os.replace(temp_path, sc)
-    except BaseException:
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
-        raise
+        return path.stat().st_mtime_ns if path.is_file() else 0
+    except OSError:
+        return 0
 
 
 @router.get("/doc")
-def read_doc(path: str = Query(...)):
+def read_doc(path: str = Query(...), since_mtime: int | None = Query(None)):
     p = _resolve(path)
+    mtime_ns = p.stat().st_mtime_ns
+    if since_mtime is not None and since_mtime == mtime_ns:
+        return {"path": str(p), "unchanged": True, "mtimeNs": mtime_ns}
     content = p.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
-    tokens = _tokens(p, content) if p.suffix.lower() in _CODE_EXT else []
-    return {"path": str(p), "content": content, "tokens": tokens}
+    tokens = _tokens(p, content) if p.suffix.lower() in common.CODE_EXT else []
+    return {"path": str(p), "unchanged": False, "mtimeNs": mtime_ns, "content": content, "tokens": tokens}
 
 
 @router.get("/annotations")
-def get_annotations(path: str = Query(...)):
-    sc = _sidecar(_resolve(path))
-    return {"items": [] if not sc.is_file() else _read_sidecar(sc)}
+def get_annotations(path: str = Query(...), since_mtime: int | None = Query(None)):
+    p = _resolve(path)
+    sc, storage = common.resolve_sidecar_for_read(p)
+    mtime_ns = _mtime_ns(sc)
+    base = {"mtimeNs": mtime_ns, "sidecarPath": str(sc), "storage": storage}
+    if since_mtime is not None and since_mtime == mtime_ns:
+        return {"unchanged": True, **base}
+    return {"unchanged": False, **base, "items": _read_items(sc) if sc.is_file() else []}
 
 
 @router.post("/annotations")
@@ -138,5 +150,12 @@ def save_annotations(body: dict):
         raise HTTPException(400, "items must be a list")
     if len(items) > 200 or len(json.dumps(items)) > 512_000:
         raise HTTPException(413, "too many/too large annotations")
-    _write_sidecar(_sidecar(p), items)
-    return {"ok": True, "count": len(items)}
+    sc, storage = common.resolve_sidecar(p)
+    # ponytail: replace is atomic on one filesystem; add locking only if concurrent editors matter.
+    common.write_sidecar_atomic(sc, items, target_file=p, storage=storage)
+    return {"ok": True, "count": len(items), "sidecarPath": str(sc), "storage": storage, "mtimeNs": _mtime_ns(sc)}
+
+
+@router.get("/recent")
+def recent(limit: int = Query(12, ge=1, le=50)):
+    return {"items": common.list_recent_sidecars(common.resolve_hermes_home(), limit=limit)}

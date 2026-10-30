@@ -1,36 +1,47 @@
 """Redline agent-side hooks: make the ::redline{...} card automatic.
 
-post_tool_call  — remember Markdown/source files this agent turn wrote (write_file/patch).
-transform_llm_output — if the final response delivered a reviewable file
-and the agent did not emit a ::redline directive itself, append one (desktop only).
+post_tool_call  — remember Markdown/source files this agent turn wrote (write_file/patch), up to 8.
+transform_llm_output — if the final response delivered reviewable files and the agent did not emit
+a top-level ::redline directive itself, append one (desktop only): ``file`` plus ``file_1..N``.
 
 Observer/transform only; no core overrides. Fail-soft by design: any error here
 must never affect the response.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
-from pathlib import Path, PurePosixPath
+import sys
+from pathlib import Path
+
+
+def _load_common():
+    """Load redline_common.py beside this file; the plugin package name is synthetic, so go by path."""
+    existing = sys.modules.get("redline_common")
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location("redline_common", Path(__file__).resolve().parent / "redline_common.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("redline_common.py not found beside the plugin")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("redline_common", module)
+    spec.loader.exec_module(module)
+    return sys.modules["redline_common"]
+
+
+_common = _load_common()
+strip_fenced_code = _common.strip_fenced_code
+skip_auto_card_path = _common.skip_auto_card_path
+MD_EXT = _common.MD_EXT
+CODE_EXT = _common.CODE_EXT
 
 _DIRECTIVE_RE = re.compile(r"::redline\{")
-_MD_EXT = {".md", ".markdown"}
-_CODE_EXT = (".py", ".sh", ".js", ".ts", ".tsx", ".c", ".h", ".cpp", ".go", ".rs", ".rb",
-             ".yaml", ".yml", ".json", ".toml", ".sql")
 # ponytail: path heuristics instead of a config knob; add config_schema if users want opt-out granularity.
 _MIN_BYTES = 200
+MAX_BUNDLE_FILES = 8
 
-_written: dict[str, str] = {}
-
-
-def _skip_path(path: str | Path) -> bool:
-    parts = tuple(part.lower() for part in PurePosixPath(str(path).replace("\\", "/")).parts)
-    return (
-        any(parts[i:i + 2] == (".hermes", "cache") for i in range(len(parts) - 1))
-        or "skills" in parts
-        or ".git" in parts
-        or bool(parts and parts[-1].endswith(".redline.json"))
-    )
+_written: dict[str, list[str]] = {}
 
 
 def _eligible(path: str) -> bool:
@@ -39,14 +50,12 @@ def _eligible(path: str) -> bool:
     except Exception:
         return False
     ext = p.suffix.lower()
-    if ext not in _MD_EXT and ext not in _CODE_EXT:
+    if ext not in MD_EXT and ext not in CODE_EXT:
         return False
-    if _skip_path(path):
-        return False
-    if p.name.lower() in {"readme.md", "skill.md", "agents.md", "changelog.md"}:
+    if skip_auto_card_path(path):
         return False
     try:
-        if not p.is_file() or p.stat().st_size < (_MIN_BYTES if ext in _MD_EXT else 40):
+        if not p.is_file() or p.stat().st_size < (_MIN_BYTES if ext in MD_EXT else 40):
             return False
     except OSError:
         return False
@@ -61,23 +70,35 @@ def _post_tool_call(tool_name: str, args: dict, result, session_id: str = "", **
         if tool_name not in {"write_file", "patch"}:
             return
         path = (args or {}).get("path") or ""
-        if path and _eligible(path):
-            _written[session_id or "_"] = str(Path(path).expanduser().resolve())
+        if not path or not _eligible(path):
+            return
+        resolved = str(Path(path).expanduser().resolve())
+        bucket = _written.setdefault(session_id or "_", [])
+        if resolved not in bucket and len(bucket) < MAX_BUNDLE_FILES:
+            bucket.append(resolved)
     except Exception:
         pass  # observers must never break a turn
 
 
 def _transform_llm_output(response_text: str, session_id: str = "", **kwargs):
     try:
-        if kwargs.get("platform") != "desktop" or not response_text or _DIRECTIVE_RE.search(response_text):
+        if kwargs.get("platform") != "desktop":
             return None
-        path = _written.pop(session_id or "_", None)
-        if not path:
+        paths = _written.pop(session_id or "_", None)
+        if not response_text or not paths:
+            return None
+        # A literal directive quoted inside a fenced block is documentation, not a card.
+        if _DIRECTIVE_RE.search(strip_fenced_code(response_text)):
+            return None
+        paths = [p for p in paths if Path(p).is_file()]
+        if not paths:
             return None
         # ensure_ascii=False: the desktop directive parser reads attribute values
         # verbatim (no JSON unescape), so \uXXXX escapes would reach the redline
         # backend as literal text and 404 on any non-ASCII path.
-        return response_text + f"\n\n::redline{{file={json.dumps(path, ensure_ascii=False)}}}"
+        attrs = [f"file={json.dumps(paths[0], ensure_ascii=False)}"]
+        attrs += [f"file_{i}={json.dumps(p, ensure_ascii=False)}" for i, p in enumerate(paths[1:], 1)]
+        return response_text + f"\n\n::redline{{{', '.join(attrs)}}}"
     except Exception:
         return None  # fail-soft: never touch the response on error
 

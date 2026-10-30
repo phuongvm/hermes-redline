@@ -19,8 +19,9 @@ const KINDS = {
 const $openCount = atom(0)
 
 const MD_EXT = ['.md', '.markdown']
-const CODE_EXT = ['.py', '.sh', '.js', '.ts', '.tsx', '.c', '.h', '.cpp', '.go', '.rs', '.rb',
-  '.yaml', '.yml', '.json', '.toml', '.sql']
+const CODE_EXT = ['.py', '.sh', '.ps1', '.psm1', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx',
+  '.html', '.svg', '.css', '.scss', '.c', '.h', '.cpp', '.go', '.rs', '.rb',
+  '.yaml', '.yml', '.json', '.toml', '.xml', '.ini', '.cfg', '.sql']
 const hasExt = (path, extensions) => extensions.some((extension) => path.toLowerCase().endsWith(extension))
 
 // Every annotation stores the text it was made on. That quote is located inside the rendered block,

@@ -16,7 +16,7 @@ Redline turns Markdown documents and supported source files into a review surfac
 - One click opens the file in a pane docked beside the chat — Markdown uses the app's own renderer; source files use numbered lines with optional syntax highlighting and your theme's colors.
 - Select any passage → a pill offers ◆ comment · ◇ question · ✎ change request.
 - Each annotation becomes a floating card over the text. The passage it was made on carries a coloured wash and its marker sits beside those words in the margin, so a thread always shows which passage it belongs to. Threads that land on the same line stack.
-- Annotations persist in a sidecar next to your file (`<file><ext>.redline.json`, such as `doc.md.redline.json` or `app.tsx.redline.json`) — close the pane, come back tomorrow, your review is still there.
+- Annotations persist in a sidecar — close the pane, come back tomorrow, your review is still there. With the default `auto` mode a file inside a Git repo or worktree keeps its annotations under `<hermes_home>/redline/annotations/` (so the working tree stays clean); an existing `<file><ext>.redline.json` beside the file keeps being used, and files outside Git use `<file><ext>.redline.json`. Set `REDLINE_SIDECAR_MODE` (`auto` | `central` | `adjacent`) or `plugins.entries.redline.settings.sidecar_mode` to force one.
 
 ## The loop
 
@@ -57,7 +57,8 @@ Three pieces, no core patches — everything through the Desktop plugin SDK:
 |---|---|
 | `desktop/plugin.js` | transcript directive, review pane, selection pill, floating cards, margin markers, batch composer |
 | `dashboard/plugin_api.py` | tiny FastAPI backend: reads Markdown/source files and persists annotations |
-| `<file><ext>.redline.json` | sidecar beside your file — the annotation list, yours to keep |
+| `redline_common.py` | stdlib-only shared module: extension sets, fenced-code stripping, skip rules, sidecar resolution |
+| `<file><ext>.redline.json` / `<hermes_home>/redline/annotations/*.redline.json` | the annotation list (adjacent or centralized sidecar), yours to keep |
 
 Agent-side hooks remember eligible Markdown/source files written via `write_file` or `patch` and append the card directive automatically at the end of the response. The agent side is otherwise just a message format: a batch arrives as `⁂ redline — review of <path> (N notes):` with numbered `selection:` entries; code selections include `L<n>:` line anchors, which any Hermes agent can act on.
 
@@ -70,7 +71,9 @@ Agent-side hooks remember eligible Markdown/source files written via `write_file
 
 ## Supported files
 
-Markdown: `.md`, `.markdown`. Source/config: `.py`, `.sh`, `.js`, `.ts`, `.tsx`, `.c`, `.h`, `.cpp`, `.go`, `.rs`, `.rb`, `.yaml`, `.yml`, `.json`, `.toml`, `.sql`. Source files render as numbered lines; batch selections carry `L<n>:` anchors.
+Markdown: `.md`, `.markdown`. Source/config: `.py`, `.sh`, `.ps1`, `.psm1`, `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.tsx`, `.html`, `.svg`, `.css`, `.scss`, `.c`, `.h`, `.cpp`, `.go`, `.rs`, `.rb`, `.yaml`, `.yml`, `.json`, `.toml`, `.xml`, `.ini`, `.cfg`, `.sql`. Source files render as numbered lines; batch selections carry `L<n>:` (or `L<start>-L<end>:` for a multi-line selection) anchors.
+
+A turn that writes several reviewable files appends one multi-file directive: `::redline{file="a.md", file_1="b.md", file_2="c.md"}` (up to 8, in write order); the pane shows a tab per file. A `::redline{` quoted inside a fenced code block does not suppress the automatic card.
 
 ## Known limits
 

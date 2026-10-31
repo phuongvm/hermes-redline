@@ -125,11 +125,17 @@ def _mtime_unchanged(since_mtime: int | None, mtime_ns: int) -> bool:
 
     ``st_mtime_ns`` needs 61 bits but a JavaScript client holds it as an IEEE-754 float64 (53-bit
     mantissa) and echoes back a rounded value (decimal-shortest, e.g. ...456800 for ...456789), so
-    also accept any ``since_mtime`` that rounds to the same float64 as ``mtime_ns``.
+    also accept a ``since_mtime`` that rounds to the same float64 as ``mtime_ns``, bounded to a
+    1 ms distance so a real edit is never mistaken for float64 rounding noise.
     """
     if since_mtime is None:
         return False
-    return since_mtime == mtime_ns or (since_mtime > 0 and float(since_mtime) == float(mtime_ns))
+    return since_mtime == mtime_ns or (
+        mtime_ns > 0
+        and since_mtime > 0
+        and abs(since_mtime - mtime_ns) < 1_000_000
+        and float(since_mtime) == float(mtime_ns)
+    )
 
 
 @router.get("/doc")

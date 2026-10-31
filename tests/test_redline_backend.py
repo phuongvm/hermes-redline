@@ -590,3 +590,24 @@ def test_api_post_annotations_tags_session_and_recent_filters_by_it(api, tmp_pat
     assert [Path(r["path"]).name for r in api.get("/recent", params={"session_id": "sB"}).json()["items"]] == ["b.md"]
     assert api.get("/recent", params={"session_id": ""}).json()["items"] == []
     assert api.get("/recent", params={"session_id": "session-empty"}).json()["items"] == []
+
+
+def test_mtime_unchanged_bounded_float64_predicate(api):
+    """Spec (design.md Decision 4): equality, or positive values within 1_000_000 ns that share one float64."""
+    fn = api.module._mtime_unchanged
+    ns = 1_793_456_789_123_456_700
+    assert fn(ns, ns) is True
+    assert fn(_js_roundtrip(ns), ns) is True            # JS-rounded echo, inside the bound
+    assert fn(None, ns) is False
+    assert fn(0, ns) is False                            # zero since_mtime never matches a real file
+    assert fn(0, 0) is True                              # exact equality is still equality
+    assert fn(-5, 0) is False                            # negative never float-equal-accepted
+    assert fn(ns, 0) is False                            # missing file (mtime_ns == 0) never float-matches
+    assert fn(ns + 5_000_000_000, ns) is False           # real edit beyond float64 resolution
+    # distance bound: float64-equal values farther than 1_000_000 ns apart are NOT accepted
+    big = 2 ** 62                                        # float64 spacing is 1024 here
+    assert float(big + 1) == float(big) and fn(big + 1, big) is True
+    assert fn(big + 600_000, big) is False               # beyond bound and not float-equal anyway
+    huge = 2 ** 80                                       # spacing 2**28 ~ 2.7e8 > 1_000_000
+    assert float(huge + 2 ** 20) == float(huge)
+    assert fn(huge + 2 ** 20, huge) is False             # float-equal but outside the 1_000_000 ns bound

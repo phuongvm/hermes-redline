@@ -71,8 +71,18 @@ check(byId('page') && byId('page').area === sdk.ROUTES_AREA && byId('page').data
 check(byId('nav') && byId('nav').area === sdk.SIDEBAR_NAV_AREA && byId('nav').data.asTile === true, 'SIDEBAR_NAV_AREA entry has asTile: true')
 check(byId('directive') && byId('directive').data.name === 'redline', 'transcript directive registered')
 const chipTree = byId('chip').render()
+check(chipTree.type(chipTree.props) === null, 'chip renders nothing while the focused session has no reviewable document')
+sdk.host.focusedSessionId = 'smoke-session'
+byId('directive').data.render({ attrs: { file: '/smoke/a.md', file_1: '/smoke/b.md' }, sessionId: 'smoke-session' })
+await new Promise((resolve) => setImmediate(resolve))
 const chip = chipTree.type(chipTree.props)
-check(chip.type === 'button' && chip.props.type === 'button', 'chip renders a <button>')
+check(chip && chip.type === 'button' && chip.props.type === 'button', 'chip renders a <button> once the session has documents')
+check(chip && chip.props.children.some((c) => c && c.type === sdk.Codicon && c.props.name === 'comment-discussion'), 'chip uses the comment-discussion codicon')
+check(chip && chip.props.children.some((c) => c && c.type === 'b' && c.props.children === '2'), 'chip shows the focused session document count in bold')
+check(/\.rl-browser\{[^}]*overflow-y:auto/.test(plugin.internals.CSS), 'file browser CSS scrolls vertically')
+for (const name of ['parentFolder', 'groupByFolder', 'shortFolderLabel', 'recentSessionQuery']) {
+  check(typeof plugin.internals[name] === 'function', `helper ${name} is exported`)
+}
 
 const internals = plugin.internals
 check(internals.__proto__ === Object.prototype && plugin.__test === plugin.internals, '__test aliases internals')

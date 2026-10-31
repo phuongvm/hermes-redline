@@ -8,7 +8,7 @@ import * as sdk from './stubs/plugin-sdk.mjs'
 
 const plugin = await loadPlugin()
 const { fileBasename, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
-  normalizeFilePath, pathKey, dedupePaths, samePath, MD_EXT, CODE_EXT } = plugin.internals
+  normalizeFilePath, pathKey, dedupePaths, samePath, MD_EXT, CODE_EXT, parentFolder, groupByFolder, shortFolderLabel } = plugin.internals
 
 test('normalizeFilePath collapses doubled backslashes and pathKey folds separators and case', () => {
   assert.equal(normalizeFilePath('  O:\\\\\\\\workspaces\\\\\\\\a.md '), 'O:\\workspaces\\a.md')
@@ -188,7 +188,9 @@ test('a multi-attribute directive shows +N more and opens the pane with a tab pe
   assert.equal(pane.props.targetSessionId, 'sess-1')
   react.__beginRender()
   const tree = pane.type(pane.props)
-  const tabs = find(tree, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
+  const browser = find(tree, (n) => n.props.className === 'rl-browser')
+  assert.equal(browser.length, 1, 'three documents open the file browser by default')
+  const tabs = find(browser[0], (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
   assert.deepEqual(tabs.map((t) => t.props.children), ['proposal.md', 'spec.md', 'design.md'])
 })
 
@@ -201,6 +203,67 @@ test('a directive with no supported file renders nothing and a single file shows
   open.props.onClick()
   const pane = sdk.host.workspaces.at(-1).render()
   react.__beginRender()
-  const tabs = find(pane.type(pane.props), (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
-  assert.deepEqual(tabs.map((t) => t.props.title), ['/x/one.md'])
+  const tree = pane.type(pane.props)
+  assert.equal(find(tree, (n) => n.props.className === 'rl-browser').length, 0, 'one document: browser closed by default')
+  assert.equal(find(tree, (n) => n.props.className === 'rl-active')[0].props.title, '/x/one.md', 'the active file bar names the document')
+})
+
+
+// ------------------------------------------------------------------ folder grouping
+
+test('parentFolder returns the containing folder of Windows and POSIX paths', () => {
+  assert.equal(parentFolder('O:\\w\\openspec\\changes\\a\\tasks.md'), 'O:/w/openspec/changes/a')
+  assert.equal(parentFolder('/x/y/design.md'), '/x/y')
+  assert.equal(parentFolder('/design.md'), '/')
+  assert.equal(parentFolder('design.md'), '')
+})
+
+test('groupByFolder groups files by folder, keeping first-seen order and the original paths', () => {
+  const files = ['/w/a/tasks.md', '/w/b/tasks.md', '/w/a/spec.md', '\\w\\b\\spec.md', '/w/b/tasks.md']
+  const groups = groupByFolder(files)
+  assert.deepEqual(groups.map((g) => g.folder), ['/w/a', '/w/b'])
+  assert.deepEqual(groups[0].files, ['/w/a/tasks.md', '/w/a/spec.md'])
+  assert.deepEqual(groups[1].files, ['/w/b/tasks.md', '\\w\\b\\spec.md'], 'mixed separators fold into one folder; duplicates collapse')
+})
+
+test('groupByFolder keeps duplicate basenames apart under their own folders', () => {
+  const groups = groupByFolder(['/w/c1/tasks.md', '/w/c2/tasks.md', '/w/c1/spec.md', '/w/c2/spec.md'])
+  assert.equal(groups.length, 2)
+  for (const g of groups) assert.deepEqual(g.files.map(fileBasename).sort(), ['spec.md', 'tasks.md'])
+  assert.notEqual(groups[0].folder, groups[1].folder)
+})
+
+test('shortFolderLabel disambiguates with the trailing folders and keeps the root marker for top-level files', () => {
+  assert.equal(shortFolderLabel('O:/w/openspec/changes/a'), 'changes/a')
+  assert.equal(shortFolderLabel('/x'), 'x')
+  assert.equal(shortFolderLabel(''), '.')
+})
+
+test('the browser groups duplicate basenames under folder headers and is bounded to ten rows with vertical scroll', async () => {
+  const { card } = await mountDirective({ file: '/w/c1/tasks.md', file_1: '/w/c2/tasks.md', file_2: '/w/c1/spec.md', file_3: '/w/c2/spec.md' })
+  const [open] = find(card, (n) => n.type === sdk.Button)
+  open.props.onClick()
+  const pane = sdk.host.workspaces.at(-1).render()
+  react.__beginRender()
+  const tree = pane.type(pane.props)
+  const browser = find(tree, (n) => n.props.className === 'rl-browser')[0]
+  const folders = find(browser, (n) => n.props.className === 'rl-folder')
+  assert.deepEqual(folders.map((f) => f.props.title), ['/w/c1', '/w/c2'])
+  const tabs = find(browser, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
+  assert.deepEqual(tabs.map((t) => t.props.title), ['/w/c1/tasks.md', '/w/c1/spec.md', '/w/c2/tasks.md', '/w/c2/spec.md'])
+  assert.match(plugin.internals.CSS, /\.rl-browser\{[^}]*max-height:calc\(10 \* [^}]*overflow-y:auto/)
+})
+
+test('the active file bar shows the basename with its parent folder and the full path as title', async () => {
+  const { card } = await mountDirective({ file: 'O:\\w\\changes\\a\\tasks.md', file_1: 'O:\\w\\changes\\b\\tasks.md' })
+  const [open] = find(card, (n) => n.type === sdk.Button)
+  open.props.onClick()
+  const pane = sdk.host.workspaces.at(-1).render()
+  react.__beginRender()
+  const tree = pane.type(pane.props)
+  const active = find(tree, (n) => n.props.className === 'rl-active')[0]
+  assert.equal(active.props.title, 'O:\\w\\changes\\a\\tasks.md')
+  const text = JSON.stringify(active.props.children)
+  assert.match(text, /tasks\.md/)
+  assert.match(text, /changes\/a/)
 })

@@ -82,7 +82,8 @@ test('registers a /redline route and a sidebar tile', async () => {
 })
 
 test('the status-bar chip is a button that opens the standalone workspace', async () => {
-  const { byId } = await register()
+  const { byId, ctx } = await register()
+  plugin.internals.rememberSessionFiles(ctx, 'test-session', ['/w/review.md'])
   const chip = byId('chip').render()
   const tree = chip.type(chip.props)
   assert.equal(tree.type, 'button')
@@ -239,9 +240,10 @@ async function registerScoped({ recent = [], items = [] } = {}) {
   return { ctx, calls, store, byId, directive: byId('directive').data.render, standalone: byId('page') }
 }
 
-const shownPath = (tree) => (find(tree, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && / on$/.test(n.props.className) && n.props.title)[0] || { props: {} }).props.title || ''
+const shownPath = (tree) => (find(tree, (n) => n.props.className === 'rl-active')[0] || { props: {} }).props.title || ''
 const tabTitles = (tree) => find(tree, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title).map((n) => n.props.title)
 const emptyText = (tree) => find(tree, (n) => n.props.className === 'rl-empty').map((n) => JSON.stringify(n.props.children)).join('|')
+const toggleButton = (tree) => find(tree, (n) => n.type === sdk.Button && n.props.className === 'rl-browser-toggle')[0]
 const recentChips = (tree) => find(tree, (n) => n.props.className === 'rl-chip' && n.type === sdk.Button).map((n) => n.key)
 
 test('a ::redline directive registers its files against the chat that rendered it', async () => {
@@ -354,7 +356,9 @@ test('the recent query is scoped to the chat and a foreign row from an unfiltere
   sdk.host.focusedStoredSessionId = 'session-A'
   const tree = renderPane(standalone.render())
   assert.equal(shownPath(tree), '/A/annotated.md', 'a backend row of this chat opens automatically')
-  assert.deepEqual(tabTitles(tree), ['/A/annotated.md'], 'a single document is still shown as one tab')
+  assert.deepEqual(tabTitles(tree), [], 'a single document keeps the file browser closed until toggled')
+  toggleButton(tree).props.onClick()
+  assert.deepEqual(tabTitles(renderPane(standalone.render())), ['/A/annotated.md'], 'the toggle opens the browser with the one document')
   assert.deepEqual(plugin.internals.sessionRows(rows, 'session-A').map((r) => r.path), ['/A/annotated.md'])
   assert.deepEqual(plugin.internals.sessionRows(rows, ''), [])
 })
@@ -373,8 +377,13 @@ test('the compact header has no title, raw path, manual path box, open button or
   assert.equal(find(tree, (n) => n.type === sdk.Input).length, 0)
   assert.equal(button(tree, 'open'), undefined)
   assert.deepEqual(recentChips(tree), [])
-  const tabs = find(head, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
-  assert.deepEqual(tabs.map((t) => t.props.title), ['/A/doc1.md', '/A/doc2.md'], 'session tabs live in the header')
+  assert.equal(find(head, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab')).length, 0, 'no flat pill tabs in the header')
+  const active = find(head, (n) => n.props.className === 'rl-active')[0]
+  assert.equal(active.props.title, '/A/doc1.md', 'header shows the selected file with its full path as title')
+  assert.ok(toggleButton(head), 'header carries the browser toggle')
+  const browser = find(tree, (n) => n.props.className === 'rl-browser')[0]
+  const tabs = find(browser, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
+  assert.deepEqual(tabs.map((t) => t.props.title), ['/A/doc1.md', '/A/doc2.md'], 'session documents live in the file browser')
   assert.deepEqual(tabs.map((t) => t.props.children), ['doc1.md', 'doc2.md'])
   assert.match(plugin.internals.CSS, /\.rl-tab\{[^}]*max-width:220px[^}]*text-overflow:ellipsis[^}]*white-space:nowrap/)
 })
@@ -414,4 +423,120 @@ test('saving annotations tags the sidecar with the chat in view', async () => {
   assert.equal(url, '/annotations')
   assert.equal(options.body.path, '/A/doc1.md')
   assert.equal(options.body.sessionId, 'session-A')
+})
+
+
+// ------------------------------------------------------------------ file browser toggle
+
+const named = (tree, cls) => find(tree, (n) => n.props.className === cls)
+
+test('the file browser opens by default for two or more documents and stays closed until toggled for one', async () => {
+  const { directive, standalone } = await registerScoped()
+  directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md' }, sessionId: 'session-A' })
+  directive({ attrs: { file: '/B/docB.md' }, sessionId: 'session-B' })
+  await flush()
+  const pane = standalone.render()
+
+  sdk.host.focusedStoredSessionId = 'session-A'
+  assert.equal(named(renderPane(pane), 'rl-browser').length, 1, 'two documents: open by default')
+  assert.equal(toggleButton(renderPane(pane)).props['aria-expanded'], true)
+
+  toggleButton(renderPane(pane)).props.onClick()
+  assert.equal(named(renderPane(pane), 'rl-browser').length, 0, 'toggled closed')
+  assert.equal(named(renderPane(pane), 'rl-browser').length, 0, 'stays closed across renders')
+  assert.equal(toggleButton(renderPane(pane)).props['aria-expanded'], false)
+  assert.equal(shownPath(renderPane(pane)), '/A/doc1.md', 'the active file bar stays when the browser is closed')
+
+  toggleButton(renderPane(pane)).props.onClick()
+  assert.equal(named(renderPane(pane), 'rl-browser').length, 1, 'toggled open again')
+})
+
+test('clicking a file in the browser switches the active file bar and keeps the browser open', async () => {
+  const { directive, standalone } = await registerScoped()
+  directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md' }, sessionId: 'session-A' })
+  await flush()
+  sdk.host.focusedStoredSessionId = 'session-A'
+  const pane = standalone.render()
+  const second = find(renderPane(pane), (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title === '/A/doc2.md')[0]
+  second.props.onClick()
+  const tree = renderPane(pane)
+  assert.equal(shownPath(tree), '/A/doc2.md')
+  assert.equal(named(tree, 'rl-browser').length, 1)
+})
+
+// ------------------------------------------------------------------ status-bar chip
+
+const chipTree = (byId) => {
+  const chip = byId('chip').render()
+  return chip.type(chip.props)
+}
+const chipCount = (byId) => find(chipTree(byId), (n) => n.type === 'b')[0].props.children
+
+test('the chip hides when the focused session has no reviewable document', async () => {
+  const { byId, directive } = await registerScoped()
+  directive({ attrs: { file: '/A/doc1.md' }, sessionId: 'session-A' })
+  await flush()
+  sdk.host.focusedStoredSessionId = 'session-empty'
+  assert.equal(chipTree(byId), null)
+})
+
+test('the chip shows the comment-discussion icon and a bold count of the focused session documents', async () => {
+  const { byId, directive } = await registerScoped()
+  directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md', file_2: '/A/doc3.md' }, sessionId: 'session-A' })
+  directive({ attrs: { file: '/B/docB.md' }, sessionId: 'session-B' })
+  await flush()
+
+  sdk.host.focusedStoredSessionId = 'session-A'
+  const tree = chipTree(byId)
+  assert.equal(tree.type, 'button')
+  assert.match(tree.props.className, /rl-chip/)
+  assert.equal(find(tree, (n) => n.type === sdk.Codicon)[0].props.name, 'comment-discussion')
+  assert.equal(chipCount(byId), '3')
+
+  sdk.host.focusedStoredSessionId = 'session-B'
+  assert.equal(chipCount(byId), '1', 'the count follows the focused session')
+})
+
+test('the chip follows stored, runtime and active ids in that order and subscribes to the session recent query', async () => {
+  const { byId, directive } = await registerScoped()
+  directive({ attrs: { file: '/R/run.md', file_1: '/R/run2.md' }, sessionId: 'runtime-1' })
+  directive({ attrs: { file: '/C/act.md' }, sessionId: 'active-1' })
+  await flush()
+  sdk.host.focusedSessionId = 'runtime-1'
+  assert.equal(chipCount(byId), '2')
+  assert.deepEqual(sdk.host.queryKeys.at(-1), ['redline:recent', 'runtime-1'])
+  sdk.host.focusedSessionId = ''
+  sdk.host.activeSessionId = 'active-1'
+  assert.equal(chipCount(byId), '1')
+  assert.deepEqual(sdk.host.queryKeys.at(-1), ['redline:recent', 'active-1'])
+  sdk.host.focusedStoredSessionId = 'runtime-1'
+  assert.equal(chipCount(byId), '2')
+  assert.deepEqual(sdk.host.queryKeys.at(-1), ['redline:recent', 'runtime-1'])
+})
+
+test('the chip counts backend rows of the session once alongside its registered documents', async () => {
+  const rows = [
+    { path: '/A/doc1.md', sidecarPath: '/h/1.json', openCount: 1, sessionId: 'session-A' },
+    { path: '/A/annotated.md', sidecarPath: '/h/2.json', openCount: 1, sessionId: 'session-A' },
+    { path: '/B/other.md', sidecarPath: '/h/3.json', openCount: 1, sessionId: 'session-B' },
+  ]
+  const { byId, directive } = await registerScoped({ recent: rows })
+  directive({ attrs: { file: '/A/doc1.md' }, sessionId: 'session-A' })
+  await flush()
+  sdk.host.focusedStoredSessionId = 'session-A'
+  assert.equal(chipCount(byId), '2', 'doc1 counted once, annotated.md from the backend, no foreign row')
+  sdk.host.focusedStoredSessionId = 'session-C'
+  assert.equal(chipTree(byId), null)
+})
+
+test('the session recent query is limited to 32 rows and scoped to the session', async () => {
+  const { ctx } = await registerScoped()
+  const urls = []
+  const probe = { ...ctx, rest: async (url) => { urls.push(url); return {} } }
+  const options = plugin.internals.recentSessionQuery(probe, 'session A')
+  assert.deepEqual(options.queryKey, ['redline:recent', 'session A'])
+  assert.equal(options.enabled, true)
+  await options.queryFn()
+  assert.deepEqual(urls, ['/recent?limit=32&session_id=session%20A'])
+  assert.equal(plugin.internals.recentSessionQuery(probe, '').enabled, false)
 })

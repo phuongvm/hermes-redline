@@ -11,6 +11,7 @@ export function __reset() {
   host.workspaces.length = 0
   host.submissions.length = 0
   host.errors.length = 0
+  host.queryKeys.length = 0
   host.focusedSessionId = 'test-session'
   host.focusedStoredSessionId = ''
   host.activeSessionId = ''
@@ -36,16 +37,16 @@ export const atom = (initial) => {
 export const queryClient = { setQueryData() {} }
 export const useValue = (source) => (source && source.get ? source.get() : 0)
 
-export const useQuery = ({ queryKey }) => ({
-  data: query_results.get(queryKey[0]),
-  isPending: false,
-  isError: false,
-})
+export const useQuery = ({ queryKey }) => {
+  host.queryKeys.push(queryKey)
+  return { data: query_results.get(queryKey[0]), isPending: false, isError: false }
+}
 
 export const host = {
   workspaces: [],
   submissions: [],
   errors: [],
+  queryKeys: [],
   focusedSessionId: 'test-session',
   focusedStoredSessionId: '',
   activeSessionId: '',

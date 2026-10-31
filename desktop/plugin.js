@@ -17,8 +17,6 @@ const KINDS = {
   change: { label: 'change request', short: '✎', var: '--rl-change' },
 }
 
-const $openCount = atom(0)
-
 const MD_EXT = ['.md', '.markdown']
 const CODE_EXT = ['.py', '.sh', '.ps1', '.psm1', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx',
   '.html', '.svg', '.css', '.scss', '.c', '.h', '.cpp', '.go', '.rs', '.rb',
@@ -404,7 +402,13 @@ const CSS = `
 .rl-tab{border:1px solid var(--ui-stroke-secondary);background:none;border-radius:7px;padding:2px 9px;font-size:11px;color:var(--ui-text-tertiary);cursor:pointer;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rl-tab:hover{color:var(--ui-text-primary)}
 .rl-tab.on{color:var(--ui-text-primary);background:color-mix(in oklab,var(--ui-accent) 14%,transparent);border-color:var(--ui-accent)}
-.rl-head .rl-tabs{padding:0;flex:1 1 0;min-width:0}
+.rl-browser-toggle{flex:none}
+.rl-active{display:flex;align-items:baseline;gap:6px;flex:1 1 0;min-width:0;font-size:12px;color:var(--ui-text-primary);overflow:hidden;white-space:nowrap}
+.rl-active b{font-weight:600;flex:none;max-width:60%;overflow:hidden;text-overflow:ellipsis}
+.rl-active-dir{font-size:11px;color:var(--ui-text-tertiary);overflow:hidden;text-overflow:ellipsis}
+.rl-browser{--rl-row-h:24px;max-height:calc(10 * var(--rl-row-h));overflow-y:auto;margin-top:8px;border:1px solid var(--ui-stroke-secondary);border-radius:8px;padding:0}
+.rl-folder{height:var(--rl-row-h);line-height:var(--rl-row-h);padding:0 8px;font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-quaternary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rl-browser .rl-tab{display:block;width:100%;max-width:none;height:var(--rl-row-h);text-align:left;border:0;border-radius:0;padding:0 8px 0 20px}
 `
 
 /**
@@ -444,6 +448,36 @@ function dedupePaths(list) {
 function fileBasename(path) {
   const text = String(path || '')
   return text.split(/[\\/]/).filter(Boolean).pop() || text
+}
+
+/** Containing folder of a Windows or POSIX path, forward-slashed; '' for a bare file name. */
+function parentFolder(path) {
+  const parts = normalizeFilePath(path).replace(/\\+/g, '/').split('/')
+  parts.pop()
+  return parts.length === 1 && parts[0] === '' ? '/' : parts.join('/')
+}
+
+/** A folder as its last two segments, enough to tell sibling folders apart; '.' for none. */
+function shortFolderLabel(folder) {
+  const label = String(folder || '').split('/').filter(Boolean).slice(-2).join('/')
+  return label || (folder ? String(folder) : '.')
+}
+
+/** Documents grouped by folder, folders and files in first-seen order; duplicate basenames stay apart. */
+function groupByFolder(files) {
+  const groups = []
+  const byKey = new Map()
+  dedupePaths(files).forEach((file) => {
+    const folder = parentFolder(file)
+    const key = pathKey(folder)
+    if (!byKey.has(key)) {
+      const group = { folder, files: [] }
+      byKey.set(key, group)
+      groups.push(group)
+    }
+    byKey.get(key).files.push(file)
+  })
+  return groups
 }
 
 /**
@@ -724,6 +758,15 @@ function sessionFilesFor(ctx, sessionId, centralRecent) {
   return dedupePaths([...storedSessionFiles(ctx, sessionId), ...fromBackend])
 }
 
+/** The recent-rows query of one chat. Pane and status-bar chip share the key, so they share the answer. */
+function recentSessionQuery(ctx, sessionId) {
+  return {
+    queryKey: ['redline:recent', sessionId],
+    queryFn: () => ctx.rest(`/recent?limit=${MAX_SESSION_FILES}&session_id=${encodeURIComponent(sessionId)}`),
+    enabled: !!sessionId, retry: false, refetchInterval: 5000,
+  }
+}
+
 const FILTERS = [['all', 'All'], ['open', 'Open'], ['sent', 'Sent'], ['resolved', 'Resolved']]
 
 function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
@@ -749,6 +792,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
   const [seenSession, setSeenSession] = useState(null)
   const [filter, setFilter] = useState('all')
   const [updated, setUpdated] = useState(false)
+  const [browserChoice, setBrowserChoice] = useState(null)
 
   // "Bind to active chat" only lasts while that chat stays focused.
   let reboundNow = rebound
@@ -771,11 +815,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
   const docRef = useRef(null)
   const mainRef = useRef(null)
 
-  const recentQ = useQuery({
-    queryKey: ['redline:recent', effectiveSessionId],
-    queryFn: () => ctx.rest(`/recent?limit=12&session_id=${encodeURIComponent(effectiveSessionId)}`),
-    enabled: !!effectiveSessionId, retry: false, refetchInterval: 5000,
-  })
+  const recentQ = useQuery(recentSessionQuery(ctx, effectiveSessionId))
   const centralRecent = sessionRows(recentQ.data && recentQ.data.items, effectiveSessionId)
   const sessionBundle = sessionFilesFor(ctx, effectiveSessionId, centralRecent)
   // The card's own files belong to its chat (or to a detached card); another chat never inherits them.
@@ -796,11 +836,15 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
       setShown(null)
       setPill(null)
       setUpdated(false)
+      setBrowserChoice(null)
     }
   } else if (!active && bundle.length) {
     active = bundle[0]
     setActive(bundle[0])
   }
+
+  // Open by default once the chat has two documents; the toggle then decides until the chat changes.
+  const browserOpen = browserChoice === null ? bundle.length >= 2 : browserChoice
 
   const docQ = useQuery({
     queryKey: ['redline:doc', active],
@@ -819,10 +863,6 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
   const filtered = filterAnnotations(items, filter)
   const visible = items.filter((a) => a.draft || filtered.includes(a))
   const unresolved = items.filter((a) => !a.draft && a.status !== 'resolved')
-  useEffect(() => {
-    $openCount.set(open.length)
-    return () => $openCount.set(0)
-  }, [open.length])
   useEffect(() => {
     if (!updated) return undefined
     const timer = setTimeout(() => setUpdated(false), 4000)
@@ -1043,9 +1083,16 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
 
   return jsxs('div', { className: 'rl-root', children: [
     jsxs('div', { className: 'rl-head', children: [
-      bundle.length ? jsx('div', { className: 'rl-tabs', children: bundle.map((f) => jsx('button', {
-        type: 'button', className: `rl-tab${samePath(f, active) ? ' on' : ''}`, title: f, onClick: () => switchTo(f), children: fileBasename(f),
-      }, pathKey(f))) }) : null,
+      bundle.length ? jsx(Button, {
+        size: 'sm', variant: 'ghost', className: 'rl-browser-toggle', 'aria-expanded': browserOpen,
+        title: browserOpen ? 'Hide the file browser' : 'Show the file browser',
+        onClick: () => setBrowserChoice(!browserOpen),
+        children: jsx(Codicon, { name: browserOpen ? 'chevron-down' : 'chevron-right' }),
+      }) : null,
+      active ? jsxs('span', { className: 'rl-active', title: active, children: [
+        jsx('b', { children: fileBasename(active) }),
+        parentFolder(active) ? jsx('span', { className: 'rl-active-dir', children: shortFolderLabel(parentFolder(active)) }) : null,
+      ] }) : null,
       jsx('span', { style: { marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }, children: [
         updated ? jsx(Badge, { variant: 'outline', children: 'Updated' }) : null,
         !standalone ? jsx(Button, { size: 'sm', variant: 'ghost', title: 'Send this review to the chat that is open now', onClick: bindToActiveChat, children: 'Bind to active chat' }) : null,
@@ -1054,6 +1101,12 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
         jsx(Button, { size: 'sm', disabled: !open.length, onClick: sendBatch, children: `Send ${open.length || ''} to Hermes` }),
       ] }),
     ] }),
+    bundle.length && browserOpen ? jsx('div', { className: 'rl-browser', children: groupByFolder(bundle).flatMap((group) => [
+      jsx('div', { className: 'rl-folder', title: group.folder, children: shortFolderLabel(group.folder) }, `dir:${pathKey(group.folder)}`),
+      ...group.files.map((f) => jsx('button', {
+        type: 'button', className: `rl-tab${samePath(f, active) ? ' on' : ''}`, title: f, onClick: () => switchTo(f), children: fileBasename(f),
+      }, pathKey(f))),
+    ]) }) : null,
     items.length ? jsxs('div', { className: 'rl-threads', children: [
       jsx('span', { className: 'rl-mini', children: 'Threads' }),
       ...FILTERS.map(([id, label]) => jsx('button', {
@@ -1166,11 +1219,19 @@ function openStandalone(ctx) {
 }
 
 function Chip({ ctx }) {
-  const n = useValue($openCount)
+  // Follows the chat in view: the stored id, else the runtime id, else the active one.
+  const stored = useValue(sessionAtom('focusedStoredSessionId'))
+  const runtime = useValue(sessionAtom('focusedSessionId'))
+  const active = useValue(sessionAtom('activeSessionId'))
+  useValue($sessionBundles)
+  const focusedSession = String(stored || runtime || active || '')
+  const recentQ = useQuery(recentSessionQuery(ctx, focusedSession))
+  const n = sessionFilesFor(ctx, focusedSession, sessionRows(recentQ.data && recentQ.data.items, focusedSession)).length
+  if (!n) return null
   return jsxs('button', {
-    type: 'button', className: 'rl-chip', title: n ? 'open redline annotations — open Redline' : 'open Redline',
+    type: 'button', className: 'rl-chip', title: `${n} reviewable ${n === 1 ? 'document' : 'documents'} in this chat — open Redline`,
     onClick: () => openStandalone(ctx),
-    children: [jsx(Codicon, { name: 'tag', className: 'text-(--ui-accent)' }), n ? jsx('b', { children: String(n) }) : null],
+    children: [jsx(Codicon, { name: 'comment-discussion', className: 'text-(--ui-accent)' }), jsx('b', { children: String(n) })],
   })
 }
 
@@ -1183,7 +1244,7 @@ export const internals = {
   locateQuote, spanFromPoints, spanForAnnotation, resolveBlock, stackPositions, mergeBoxes, quantise, sameMarks,
   washBoxes, markerGlyph, resolutionLine, blockMarkerTops, textNodesOf, selectionSpan, rangeIn, submitToTarget,
   normalizeFilePath, pathKey, dedupePaths, samePath, CSS,
-  fileBasename, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
+  fileBasename, parentFolder, shortFolderLabel, groupByFolder, recentSessionQuery, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
   resolveTargetSession, filterAnnotations, stepThread, pollConditional, MD_EXT, CODE_EXT,
   rememberSessionFiles, sessionFilesFor, sessionRows, currentFocusedSessionId, SESSION_BUNDLES, $sessionBundles,
 }

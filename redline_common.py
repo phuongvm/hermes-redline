@@ -79,7 +79,7 @@ def skip_auto_card_path(path: str | Path) -> bool:
     parts = tuple(p.lower() for p in PurePosixPath(str(path).replace("\\", "/")).parts)
     if not parts:
         return True
-    if any(parts[i:i + 2] == (".hermes", "cache") for i in range(len(parts) - 1)):
+    if any(parts[i:i + 2] in ((".hermes", "cache"), ("cache", "scratch")) for i in range(len(parts) - 1)):
         return True
     if any(p in _SKIP_PARTS for p in parts):
         return True
@@ -299,6 +299,22 @@ def _write_text_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _path_key(path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _dedupe_paths(paths) -> list[str]:
+    """``paths`` in order, keeping the first spelling of each path (separator style and case folded)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in paths:
+        key = _path_key(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
 def _read_manifest_files(manifest: Path) -> list[str]:
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -320,17 +336,18 @@ def record_session_files(session_id, files, *, hermes_home=None, env=None) -> li
     fresh: list[str] = []
     for raw in files or []:
         try:
-            p = Path(str(raw)).expanduser().resolve()
+            # A JSON-escaped directive attribute doubles every backslash: collapse before resolving.
+            p = Path(re.sub(r"\\{2,}", lambda _m: "\\", str(raw))).expanduser().resolve()
         except (OSError, RuntimeError):
             continue
         text = str(p)
-        if text not in fresh and p.is_file() and has_reviewable_ext(p) and not skip_auto_card_path(p):
+        if _path_key(text) not in {_path_key(f) for f in fresh} and p.is_file() and has_reviewable_ext(p) and not skip_auto_card_path(p):
             fresh.append(text)
     manifest = session_manifest_path(sid, resolve_hermes_home(hermes_home, env))
     previous = _read_manifest_files(manifest)
     if not fresh:
         return previous
-    merged = (fresh + [f for f in previous if f not in fresh])[:MAX_SESSION_FILES]
+    merged = _dedupe_paths(fresh + previous)[:MAX_SESSION_FILES]
     payload = {"sessionId": sid, "updatedAt": _utc_now(), "files": merged}
     _write_text_atomic(manifest, json.dumps(payload, ensure_ascii=False, indent=2))
     return merged

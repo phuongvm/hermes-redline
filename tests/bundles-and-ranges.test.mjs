@@ -8,7 +8,31 @@ import * as sdk from './stubs/plugin-sdk.mjs'
 
 const plugin = await loadPlugin()
 const { fileBasename, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
-  MD_EXT, CODE_EXT } = plugin.internals
+  normalizeFilePath, pathKey, dedupePaths, samePath, MD_EXT, CODE_EXT } = plugin.internals
+
+test('normalizeFilePath collapses doubled backslashes and pathKey folds separators and case', () => {
+  assert.equal(normalizeFilePath('  O:\\\\\\\\workspaces\\\\\\\\a.md '), 'O:\\workspaces\\a.md')
+  assert.equal(normalizeFilePath('O:\\workspaces\\a.md'), 'O:\\workspaces\\a.md')
+  assert.equal(normalizeFilePath('O:/workspaces/a.md'), 'O:/workspaces/a.md')
+  assert.equal(normalizeFilePath(null), '')
+  const spellings = ['O:\\\\workspaces\\\\a.md', 'O:\\workspaces\\a.md', 'O:/workspaces/a.md', 'o:/Workspaces/A.MD']
+  assert.equal(new Set(spellings.map(pathKey)).size, 1)
+  assert.ok(spellings.every((s) => samePath(s, spellings[0])))
+  assert.equal(samePath('O:\\a.md', 'O:\\b.md'), false)
+  assert.equal(samePath('', ''), false)
+})
+
+test('dedupePaths keeps the first spelling of each path, normalized, in order', () => {
+  assert.deepEqual(
+    dedupePaths(['O:\\\\w\\\\a.md', 'O:\\w\\b.md', 'O:\\w\\a.md', 'O:/w/b.md', '', null, 'O:/w/c.md']),
+    ['O:\\w\\a.md', 'O:\\w\\b.md', 'O:/w/c.md'])
+})
+
+test('parseBundleFiles folds escaped and mixed separator spellings into one file', () => {
+  assert.deepEqual(
+    parseBundleFiles({ file: 'O:\\\\w\\\\a.md', file_1: 'O:\\w\\a.md', file_2: 'O:/w/a.md', file_3: 'O:\\\\w\\\\b.md' }),
+    ['O:\\w\\a.md', 'O:\\w\\b.md'])
+})
 
 test('fileBasename handles Windows and POSIX paths', () => {
   assert.equal(fileBasename('O:\\a\\b\\proposal.md'), 'proposal.md')
@@ -168,7 +192,7 @@ test('a multi-attribute directive shows +N more and opens the pane with a tab pe
   assert.deepEqual(tabs.map((t) => t.props.children), ['proposal.md', 'spec.md', 'design.md'])
 })
 
-test('a directive with no supported file renders nothing and a single file shows no tabs', async () => {
+test('a directive with no supported file renders nothing and a single file shows one tab', async () => {
   const none = await mountDirective({ file: '/x/logo.png' })
   assert.equal(none.card, null)
   const { card } = await mountDirective({ file: '/x/one.md' })
@@ -177,5 +201,6 @@ test('a directive with no supported file renders nothing and a single file shows
   open.props.onClick()
   const pane = sdk.host.workspaces.at(-1).render()
   react.__beginRender()
-  assert.equal(find(pane.type(pane.props), (n) => n.props.className === 'rl-tabs').length, 0)
+  const tabs = find(pane.type(pane.props), (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
+  assert.deepEqual(tabs.map((t) => t.props.title), ['/x/one.md'])
 })

@@ -5,7 +5,7 @@
 // the Hermes home); the pane reads its location from the /annotations reply.
 
 import {
-  Badge, Button, Codicon, Input, MessageTextContent, ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS,
+  Badge, Button, Codicon, MessageTextContent, ROUTES_AREA, SIDEBAR_NAV_AREA, STATUSBAR_AREAS,
   TRANSCRIPT_DIRECTIVE_AREA, Textarea, atom, host, queryClient, useQuery, useValue,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -344,7 +344,6 @@ const CSS = `
   --rl-question-soft:color-mix(in oklab,var(--ui-purple) 16%,transparent);
   --rl-change-soft:color-mix(in oklab,var(--ui-orange) 16%,transparent)}
 .rl-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--ui-stroke-secondary);padding-bottom:12px}
-.rl-title{font-size:15px;font-weight:600;letter-spacing:-.01em}
 .rl-path{font-size:11px;color:var(--ui-text-tertiary);max-width:34ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rl-main{flex:1;min-height:0;position:relative;margin-top:14px}
 .rl-doc{height:100%;overflow:auto;padding-right:34px;max-width:720px;line-height:1.7;-webkit-user-select:text;user-select:text}
@@ -402,10 +401,44 @@ const CSS = `
 .rl-chip:hover{color:var(--ui-text-primary)}
 .rl-chip b{font-weight:600;color:var(--ui-accent)}
 .rl-tabs,.rl-threads{display:flex;gap:4px;flex-wrap:wrap;align-items:center;padding:8px 0 0}
-.rl-tab{border:1px solid var(--ui-stroke-secondary);background:none;border-radius:7px;padding:2px 9px;font-size:11px;color:var(--ui-text-tertiary);cursor:pointer}
+.rl-tab{border:1px solid var(--ui-stroke-secondary);background:none;border-radius:7px;padding:2px 9px;font-size:11px;color:var(--ui-text-tertiary);cursor:pointer;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rl-tab:hover{color:var(--ui-text-primary)}
 .rl-tab.on{color:var(--ui-text-primary);background:color-mix(in oklab,var(--ui-accent) 14%,transparent);border-color:var(--ui-accent)}
+.rl-head .rl-tabs{padding:0;flex:1 1 0;min-width:0}
 `
+
+/**
+ * A document path as one spelling: trimmed, with doubled backslashes collapsed. A JSON-escaped directive
+ * attribute reaches the pane as `O:\\workspaces\\a.md`, while the backend reports `O:\workspaces\a.md`.
+ */
+function normalizeFilePath(value) {
+  return String(value == null ? '' : value).trim().replace(/\\+/g, '\\')
+}
+
+/** Comparison key of a path: separators and case folded, so `O:\a.md`, `O:\\a.md` and `o:/A.md` agree. */
+function pathKey(value) {
+  return normalizeFilePath(value).replace(/\\+/g, '/').toLowerCase()
+}
+
+function samePath(a, b) {
+  const key = pathKey(a)
+  return key !== '' && key === pathKey(b)
+}
+
+/** Normalized, non-empty paths in order; of several spellings of one path the first wins. */
+function dedupePaths(list) {
+  const seen = new Set()
+  const out = []
+  for (const item of list || []) {
+    const text = normalizeFilePath(item)
+    const key = pathKey(text)
+    if (text && !seen.has(key)) {
+      seen.add(key)
+      out.push(text)
+    }
+  }
+  return out
+}
 
 /** Last path segment of a Windows or POSIX path. */
 function fileBasename(path) {
@@ -421,8 +454,8 @@ function parseBundleFiles(attrs) {
   const source = attrs || {}
   const wanted = []
   const push = (value) => {
-    const text = String(value == null ? '' : value).trim()
-    if (text && (hasExt(text, MD_EXT) || hasExt(text, CODE_EXT)) && !wanted.includes(text)) wanted.push(text)
+    const text = normalizeFilePath(value)
+    if (text && (hasExt(text, MD_EXT) || hasExt(text, CODE_EXT)) && !wanted.some((w) => samePath(w, text))) wanted.push(text)
   }
   push(source.file)
   Object.keys(source)
@@ -541,7 +574,7 @@ const POLL_CACHE = new Map()
 /**
  * One poll of /doc or /annotations. Sends `since_mtime` once an answer is cached; an `unchanged`
  * reply returns the cached data untouched, anything else replaces it. `onChange` fires when a
- * cached resource turns out to have changed on disk.
+ * cached document's text turns out to differ from the cached text.
  */
 async function pollConditional(ctx, cache, key, url, onChange) {
   const prev = cache.get(key)
@@ -549,7 +582,8 @@ async function pollConditional(ctx, cache, key, url, onChange) {
   const res = await ctx.rest(useSince ? `${url}${url.includes('?') ? '&' : '?'}since_mtime=${prev.mtimeNs}` : url)
   if (res && res.unchanged && prev) return prev.data
   if (res && Number.isFinite(res.mtimeNs)) cache.set(key, { mtimeNs: res.mtimeNs, data: res })
-  if (prev && onChange) onChange()
+  // Only a different document text is a change worth flagging: a rewritten mtime with the same text is not.
+  if (prev && prev.data && onChange && res && typeof res.content === 'string' && res.content !== prev.data.content) onChange()
   return res
 }
 
@@ -658,7 +692,7 @@ const isReviewable = (path) => hasExt(path, MD_EXT) || hasExt(path, CODE_EXT)
 function storedSessionFiles(ctx, sessionId) {
   let stored = []
   try { stored = ctx.storage.get(`session-files:${sessionId}`) } catch (error) { stored = [] }
-  return [...new Set([...(SESSION_BUNDLES.get(sessionId) || []), ...(Array.isArray(stored) ? stored : [])])]
+  return dedupePaths([...(SESSION_BUNDLES.get(sessionId) || []), ...(Array.isArray(stored) ? stored : [])])
 }
 
 /** Record `files` as documents of `sessionId`. Files already known keep their place; new ones lead. */
@@ -666,8 +700,7 @@ function rememberSessionFiles(ctx, sessionId, files) {
   const sid = String(sessionId || '').trim()
   if (!sid) return []
   const previous = storedSessionFiles(ctx, sid)
-  const fresh = [...new Set((files || []).map((f) => String(f == null ? '' : f).trim()).filter((f) => f && isReviewable(f)))]
-    .filter((f) => !previous.includes(f))
+  const fresh = dedupePaths(files).filter((f) => isReviewable(f) && !previous.some((p) => samePath(p, f)))
   if (!fresh.length) return previous
   const next = [...fresh, ...previous].slice(0, MAX_SESSION_FILES)
   SESSION_BUNDLES.set(sid, next)
@@ -688,13 +721,13 @@ function sessionRows(rows, sessionId) {
 function sessionFilesFor(ctx, sessionId, centralRecent) {
   if (!sessionId) return []
   const fromBackend = sessionRows(centralRecent, sessionId).map((r) => r.path).filter(Boolean)
-  return [...new Set([...storedSessionFiles(ctx, sessionId), ...fromBackend])]
+  return dedupePaths([...storedSessionFiles(ctx, sessionId), ...fromBackend])
 }
 
 const FILTERS = [['all', 'All'], ['open', 'Open'], ['sent', 'Sent'], ['resolved', 'Resolved']]
 
 function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
-  const explicit = Array.isArray(files) && files.length ? files : (file ? [file] : [])
+  const explicit = dedupePaths(Array.isArray(files) && files.length ? files : (file ? [file] : []))
   const first = explicit[0] || ''
 
   // Which chat this pane shows. A card pins its own chat until the user switches chats; a standalone pane
@@ -705,7 +738,6 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
   useValue($sessionBundles)
   const focusedSession = String(storedFocus || runtimeFocus || activeFocus || '')
 
-  const [pathState, setPath] = useState(first)
   const [activeState, setActive] = useState(first)
   const [draftText, setDraftText] = useState('')
   const [pill, setPill] = useState(null)
@@ -748,20 +780,17 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
   const sessionBundle = sessionFilesFor(ctx, effectiveSessionId, centralRecent)
   // The card's own files belong to its chat (or to a detached card); another chat never inherits them.
   const cardOwned = !standalone && (!effectiveSessionId || effectiveSessionId === targetSessionId)
-  const bundle = cardOwned ? [...new Set([...explicit, ...sessionBundle])] : sessionBundle
+  const bundle = cardOwned ? dedupePaths([...explicit, ...sessionBundle]) : sessionBundle
 
   // Reconcile the open document with the session in view, during render so no frame shows another chat's
   // file: a chat switch lands on that chat's first document, or on the empty state when it has none.
-  let path = pathState
   let active = activeState
   if (seenSession !== effectiveSessionId) {
     setSeenSession(effectiveSessionId)
     const landing = bundle[0] || ''
     if (seenSession !== null || landing !== active) {
       active = landing
-      path = landing
       setActive(landing)
-      setPath(landing)
     }
     if (seenSession !== null) {
       setShown(null)
@@ -770,9 +799,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
     }
   } else if (!active && bundle.length) {
     active = bundle[0]
-    path = bundle[0]
     setActive(bundle[0])
-    setPath(bundle[0])
   }
 
   const docQ = useQuery({
@@ -809,11 +836,10 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
     ? docQ.data.content.split('\n')
     : splitMarkdownBlocks(docQ.data.content))
 
-  useEffect(() => { if (first) { setActive(first); setPath(first) } }, [first])
+  useEffect(() => { if (first) setActive(first) }, [first])
 
   const switchTo = (next) => {
     setActive(next)
-    setPath(next)
     setShown(null)
     setPill(null)
     setUpdated(false)
@@ -1015,25 +1041,11 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
     host.notify({ kind: 'info', message: 'redline: annotation sent to Hermes' })
   }
 
-  const load = () => {
-    const p = path.trim()
-    if (!p) return
-    switchTo(p)
-    if (!effectiveSessionId) return // no chat in view: nothing to attribute the file to, so nothing is remembered
-    const key = `recent:${effectiveSessionId}`
-    const earlier = (ctx.storage.get(key) || []).filter((x) => x !== p)
-    ctx.storage.set(key, [p, ...earlier].slice(0, 6))
-    rememberSessionFiles(ctx, effectiveSessionId, [p])
-  }
-  const recent = effectiveSessionId ? (ctx.storage.get(`recent:${effectiveSessionId}`) || []) : []
-
   return jsxs('div', { className: 'rl-root', children: [
     jsxs('div', { className: 'rl-head', children: [
-      jsx('span', { className: 'rl-title', children: 'redline' }),
-      active ? jsx('span', { className: 'rl-path', title: active, children: active }) : null,
-      jsx(Input, { value: path, placeholder: 'File path (Markdown or code)', className: 'w-64', onChange: (e) => setPath(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') load() } }),
-      jsx(Button, { size: 'sm', variant: 'outline', onClick: load, children: 'open' }),
-      recent.length ? jsx('span', { style: { display: 'flex', gap: 4, flexWrap: 'wrap' }, children: recent.map((r) => jsx(Button, { size: 'sm', variant: 'ghost', className: 'rl-chip', onClick: () => switchTo(r) }, fileBasename(r))) }) : null,
+      bundle.length ? jsx('div', { className: 'rl-tabs', children: bundle.map((f) => jsx('button', {
+        type: 'button', className: `rl-tab${samePath(f, active) ? ' on' : ''}`, title: f, onClick: () => switchTo(f), children: fileBasename(f),
+      }, pathKey(f))) }) : null,
       jsx('span', { style: { marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }, children: [
         updated ? jsx(Badge, { variant: 'outline', children: 'Updated' }) : null,
         !standalone ? jsx(Button, { size: 'sm', variant: 'ghost', title: 'Send this review to the chat that is open now', onClick: bindToActiveChat, children: 'Bind to active chat' }) : null,
@@ -1042,9 +1054,6 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
         jsx(Button, { size: 'sm', disabled: !open.length, onClick: sendBatch, children: `Send ${open.length || ''} to Hermes` }),
       ] }),
     ] }),
-    bundle.length > 1 ? jsx('div', { className: 'rl-tabs', children: bundle.map((f) => jsx('button', {
-      type: 'button', className: `rl-tab${f === active ? ' on' : ''}`, title: f, onClick: () => switchTo(f), children: fileBasename(f),
-    }, f)) }) : null,
     items.length ? jsxs('div', { className: 'rl-threads', children: [
       jsx('span', { className: 'rl-mini', children: 'Threads' }),
       ...FILTERS.map(([id, label]) => jsx('button', {
@@ -1064,7 +1073,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
                 type: 'button', className: 'rl-tab', title: r.path, onClick: () => switchTo(r.path),
                 children: `${fileBasename(r.path)} · ${r.openCount} open`,
               }, r.sidecarPath || r.path)),
-            ] : 'Enter a file path above to start a review.' })
+            ] : 'No documents to review in this session.' })
           : docQ.isPending
             ? jsx('div', { className: 'rl-empty', children: 'loading…' })
             : docQ.isError
@@ -1173,6 +1182,7 @@ function Chip({ ctx }) {
 export const internals = {
   locateQuote, spanFromPoints, spanForAnnotation, resolveBlock, stackPositions, mergeBoxes, quantise, sameMarks,
   washBoxes, markerGlyph, resolutionLine, blockMarkerTops, textNodesOf, selectionSpan, rangeIn, submitToTarget,
+  normalizeFilePath, pathKey, dedupePaths, samePath, CSS,
   fileBasename, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
   resolveTargetSession, filterAnnotations, stepThread, pollConditional, MD_EXT, CODE_EXT,
   rememberSessionFiles, sessionFilesFor, sessionRows, currentFocusedSessionId, SESSION_BUNDLES, $sessionBundles,

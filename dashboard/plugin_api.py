@@ -120,11 +120,23 @@ def _mtime_ns(path: Path) -> int:
         return 0
 
 
+def _mtime_unchanged(since_mtime: int | None, mtime_ns: int) -> bool:
+    """True when ``since_mtime`` (the ``mtimeNs`` a client got earlier) still names ``mtime_ns``.
+
+    ``st_mtime_ns`` needs 61 bits but a JavaScript client holds it as an IEEE-754 float64 (53-bit
+    mantissa) and echoes back a rounded value (decimal-shortest, e.g. ...456800 for ...456789), so
+    also accept any ``since_mtime`` that rounds to the same float64 as ``mtime_ns``.
+    """
+    if since_mtime is None:
+        return False
+    return since_mtime == mtime_ns or (since_mtime > 0 and float(since_mtime) == float(mtime_ns))
+
+
 @router.get("/doc")
 def read_doc(path: str = Query(...), since_mtime: int | None = Query(None)):
     p = _resolve(path)
     mtime_ns = p.stat().st_mtime_ns
-    if since_mtime is not None and since_mtime == mtime_ns:
+    if _mtime_unchanged(since_mtime, mtime_ns):
         return {"path": str(p), "unchanged": True, "mtimeNs": mtime_ns}
     content = p.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
     tokens = _tokens(p, content) if p.suffix.lower() in common.CODE_EXT else []
@@ -137,7 +149,7 @@ def get_annotations(path: str = Query(...), since_mtime: int | None = Query(None
     sc, storage = common.resolve_sidecar_for_read(p)
     mtime_ns = _mtime_ns(sc)
     base = {"mtimeNs": mtime_ns, "sidecarPath": str(sc), "storage": storage}
-    if since_mtime is not None and since_mtime == mtime_ns:
+    if _mtime_unchanged(since_mtime, mtime_ns):
         return {"unchanged": True, **base}
     return {"unchanged": False, **base, "items": _read_items(sc) if sc.is_file() else []}
 

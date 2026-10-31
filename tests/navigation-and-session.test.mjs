@@ -186,6 +186,33 @@ test('pollConditional sends since_mtime once cached, reuses data on unchanged an
   assert.equal(changed, 1, 'only the real change fires onChange; the first load does not')
 })
 
+test('pollConditional stays quiet when a full reply carries the same content (float64-rounded mtime idle poll)', async () => {
+  const cache = new Map()
+  const replies = [
+    { mtimeNs: 1793456789123456800, unchanged: false, content: 'same' },
+    { mtimeNs: 1793456789123456789, unchanged: false, content: 'same' },
+    { mtimeNs: 1793456789123456800, unchanged: false, content: 'same' },
+    { mtimeNs: 1793456789999999999, unchanged: false, content: 'edited' },
+  ]
+  const ctx = { rest: async () => replies.shift() }
+  let changed = 0
+  for (let i = 0; i < 4; i += 1) {
+    const res = await pollConditional(ctx, cache, 'doc:/a', '/doc?path=%2Fa', () => { changed += 1 })
+    assert.equal(res.content, i === 3 ? 'edited' : 'same')
+  }
+  assert.equal(changed, 1, 'only the genuine content edit flashes Updated')
+})
+
+test('pollConditional never flags a content-less reply (annotations) because only /doc text edits flash Updated', async () => {
+  const cache = new Map()
+  const replies = [{ mtimeNs: 1, unchanged: false, items: [] }, { mtimeNs: 2, unchanged: false, items: [{ id: 'a' }] }]
+  const ctx = { rest: async () => replies.shift() }
+  let changed = 0
+  await pollConditional(ctx, cache, 'ann:/a', '/annotations?path=%2Fa', () => { changed += 1 })
+  await pollConditional(ctx, cache, 'ann:/a', '/annotations?path=%2Fa', () => { changed += 1 })
+  assert.equal(changed, 0)
+})
+
 
 // ------------------------------------------------------------------ session-scoped documents
 
@@ -212,7 +239,7 @@ async function registerScoped({ recent = [], items = [] } = {}) {
   return { ctx, calls, store, byId, directive: byId('directive').data.render, standalone: byId('page') }
 }
 
-const shownPath = (tree) => (find(tree, (n) => n.props.className === 'rl-path' && n.props.title)[0] || { props: {} }).props.title || ''
+const shownPath = (tree) => (find(tree, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && / on$/.test(n.props.className) && n.props.title)[0] || { props: {} }).props.title || ''
 const tabTitles = (tree) => find(tree, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title).map((n) => n.props.title)
 const emptyText = (tree) => find(tree, (n) => n.props.className === 'rl-empty').map((n) => JSON.stringify(n.props.children)).join('|')
 const recentChips = (tree) => find(tree, (n) => n.props.className === 'rl-chip' && n.type === sdk.Button).map((n) => n.key)
@@ -270,8 +297,8 @@ test('switching to a chat with no documents clears the pane and leaks nothing fr
   assert.deepEqual(tabTitles(tree), [])
   assert.deepEqual(recentChips(tree), [], 'global recent chips are never shown')
   assert.doesNotMatch(emptyText(tree), /redline_cutover|spec\.md|docA|global\.md|Recently annotated/)
-  const input = find(tree, (n) => n.type === sdk.Input)[0]
-  assert.equal(input.props.value, '', 'path box cleared too')
+  assert.match(emptyText(tree), /No documents to review in this session\./)
+  assert.equal(find(tree, (n) => n.type === sdk.Input).length, 0, 'no manual path box')
 
   sdk.host.focusedStoredSessionId = 'session-A'
   assert.equal(shownPath(renderPane(pane)), '/A/docA.md', 'switching back restores the chat documents')
@@ -327,28 +354,53 @@ test('the recent query is scoped to the chat and a foreign row from an unfiltere
   sdk.host.focusedStoredSessionId = 'session-A'
   const tree = renderPane(standalone.render())
   assert.equal(shownPath(tree), '/A/annotated.md', 'a backend row of this chat opens automatically')
-  assert.deepEqual(tabTitles(tree), [], 'a single document needs no tab strip')
+  assert.deepEqual(tabTitles(tree), ['/A/annotated.md'], 'a single document is still shown as one tab')
   assert.deepEqual(plugin.internals.sessionRows(rows, 'session-A').map((r) => r.path), ['/A/annotated.md'])
   assert.deepEqual(plugin.internals.sessionRows(rows, ''), [])
 })
 
-test('opening a path records it under recent:<chat> and the chat documents, never the global recent list', async () => {
-  const { standalone, store, ctx } = await registerScoped()
-  sdk.host.focusedStoredSessionId = 'session-A'
-  const pane = standalone.render()
-  let tree = renderPane(pane)
-  const input = find(tree, (n) => n.type === sdk.Input)[0]
-  input.props.onChange({ target: { value: '/A/typed.md' } })
-  tree = renderPane(pane)
-  button(tree, 'open').props.onClick()
+test('the compact header has no title, raw path, manual path box, open button or recent chips', async () => {
+  const { directive, standalone, store } = await registerScoped()
+  store.set('recent:session-A', ['/A/old.md'])
+  directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md' }, sessionId: 'session-A' })
   await flush()
-  assert.deepEqual(store.get('recent:session-A'), ['/A/typed.md'])
+  sdk.host.focusedStoredSessionId = 'session-A'
+  const tree = renderPane(standalone.render())
+  const head = find(tree, (n) => n.props.className === 'rl-head')[0]
+  assert.ok(head, 'header present')
+  assert.equal(find(tree, (n) => n.props.className === 'rl-title').length, 0)
+  assert.equal(find(tree, (n) => n.props.className === 'rl-path').length, 0)
+  assert.equal(find(tree, (n) => n.type === sdk.Input).length, 0)
+  assert.equal(button(tree, 'open'), undefined)
+  assert.deepEqual(recentChips(tree), [])
+  const tabs = find(head, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title)
+  assert.deepEqual(tabs.map((t) => t.props.title), ['/A/doc1.md', '/A/doc2.md'], 'session tabs live in the header')
+  assert.deepEqual(tabs.map((t) => t.props.children), ['doc1.md', 'doc2.md'])
+  assert.match(plugin.internals.CSS, /\.rl-tab\{[^}]*max-width:220px[^}]*text-overflow:ellipsis[^}]*white-space:nowrap/)
+})
+
+test('escaped, native and forward-slash spellings of one document make one tab', async () => {
+  const { directive, standalone, store, ctx } = await registerScoped()
+  directive({ attrs: { file: 'O:\\\\w\\\\a.md', file_1: 'O:\\\\w\\\\b.md' }, sessionId: 'session-A' })
+  directive({ attrs: { file: 'O:\\w\\a.md', file_1: 'O:/w/b.md', file_2: 'O:/w/c.md' }, sessionId: 'session-A' })
+  await flush()
+  assert.equal(plugin.internals.SESSION_BUNDLES.get('session-A').length, 3)
+  assert.ok(plugin.internals.SESSION_BUNDLES.get('session-A').every((f) => !f.includes('\\\\')), 'no doubled backslashes kept')
+  // a persisted copy written before the fix is folded on read
+  store.set('session-files:session-B', ['O:\\\\w\\\\a.md', 'O:\\w\\a.md', 'O:/w/a.md'])
+  assert.deepEqual(plugin.internals.sessionFilesFor(ctx, 'session-B', [{ path: 'o:/W/A.md', sessionId: 'session-B' }]), ['O:\\w\\a.md'])
+  sdk.host.focusedStoredSessionId = 'session-A'
+  const tree = renderPane(standalone.render())
+  assert.equal(tabTitles(tree).length, 3)
+  assert.equal(new Set(tabTitles(tree).map(plugin.internals.pathKey)).size, 3)
+})
+
+test('opening files records them under the chat documents only through directives, never a global recent list', async () => {
+  const { directive, store, ctx } = await registerScoped()
+  directive({ attrs: { file: '/A/typed.md' }, sessionId: 'session-A' })
+  await flush()
   assert.equal(store.has('recent'), false, 'the global recent key is never written')
   assert.deepEqual(plugin.internals.sessionFilesFor(ctx, 'session-A', []), ['/A/typed.md'])
-  assert.deepEqual(recentChips(renderPane(pane)), ['typed.md'])
-
-  sdk.host.focusedStoredSessionId = 'session-B'
-  assert.deepEqual(recentChips(renderPane(pane)), [], 'another chat does not see session-A recents')
 })
 
 test('saving annotations tags the sidecar with the chat in view', async () => {

@@ -28,7 +28,8 @@ def common():
 
 
 @pytest.fixture()
-def hooks(common):
+def hooks(common, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hooks_hermes_home"))
     module = _load("redline_hooks_under_test", ROOT / "__init__.py")
     module._written.clear()
     return module
@@ -121,6 +122,19 @@ def test_common_skip_auto_card_path_keeps_lookalikes_and_worktrees(common, path)
 ])
 def test_common_skip_auto_card_path_skips_infrastructure(common, path):
     assert common.skip_auto_card_path(path) is True
+
+
+@pytest.mark.parametrize("path", [
+    r"C:\Users\x\AppData\Local\hermes\cache\scratch\probe.py", "/h/cache/scratch/notes.md",
+    "O:/workspaces/_config/hermes/profiles/coder/cache/scratch/a.md",
+])
+def test_common_skip_auto_card_path_skips_cache_scratch(common, path):
+    assert common.skip_auto_card_path(path) is True
+
+
+def test_common_skip_auto_card_path_keeps_scratch_outside_cache(common):
+    assert common.skip_auto_card_path("/w/scratch/notes.md") is False
+    assert common.skip_auto_card_path("/w/cache/notes.md") is False
 
 
 def test_common_resolve_hermes_home_precedence(common, tmp_path):
@@ -320,6 +334,36 @@ def test_api_doc_since_mtime_short_circuits_without_lexing(api, tmp_path, monkey
     assert calls == [1]
 
 
+def _js_roundtrip(ns: int) -> int:
+    """What a JS client sends back for ``ns``: ``String(Number(ns))`` is the shortest decimal of the float64."""
+    from decimal import Decimal
+    return int(Decimal(repr(float(ns))))
+
+
+def test_api_doc_since_mtime_survives_ieee754_float64_rounding(api, tmp_path):
+    p = tmp_path / "f.md"
+    p.write_text("# T\n", encoding="utf-8")
+    ns = 1_793_456_789_123_456_700  # 61-bit (100 ns steps on NTFS): a JS Number cannot hold it exactly
+    os.utime(p, ns=(ns, ns))
+    first = api.get("/doc", params={"path": str(p)}).json()
+    assert first["mtimeNs"] == ns and _js_roundtrip(ns) != ns  # JSON.parse then String() gives ...800
+    rounded = api.get("/doc", params={"path": str(p), "since_mtime": _js_roundtrip(ns)}).json()
+    assert rounded == {"path": first["path"], "unchanged": True, "mtimeNs": ns}
+    # a real edit well beyond float64 resolution is still reported
+    os.utime(p, ns=(ns + 5_000_000_000,) * 2)
+    assert api.get("/doc", params={"path": str(p), "since_mtime": _js_roundtrip(ns)}).json()["unchanged"] is False
+    assert api.get("/doc", params={"path": str(p), "since_mtime": 0}).json()["unchanged"] is False
+
+
+def test_api_annotations_since_mtime_survives_ieee754_float64_rounding(api, tmp_path):
+    plan = _md(tmp_path / "repo" / "plan.md")
+    sc = Path(api.post("/annotations", json={"path": str(plan), "items": []}).json()["sidecarPath"])
+    ns = 1_793_456_789_123_456_700
+    os.utime(sc, ns=(ns, ns))
+    rounded = api.get("/annotations", params={"path": str(plan), "since_mtime": _js_roundtrip(ns)}).json()
+    assert rounded["unchanged"] is True and rounded["mtimeNs"] == ns
+
+
 def test_api_annotations_central_mode_keeps_repo_clean_and_short_circuits(api, tmp_path):
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
@@ -421,6 +465,22 @@ def test_record_session_files_keeps_reviewable_existing_files_in_front_order(com
     assert merged == [str(c), str(b), str(a)]  # new files lead, no duplicates
     manifest = json.loads(common.session_manifest_path("s1", home).read_text(encoding="utf-8"))
     assert manifest["sessionId"] == "s1" and manifest["files"] == merged and manifest["updatedAt"]
+
+
+def test_record_session_files_collapses_escaped_separators_into_one_entry(common, tmp_path):
+    home = tmp_path / "h"
+    a = _md(tmp_path / "docs" / "a.md")
+    escaped = str(a).replace("\\", "\\\\")  # JSON-escaped directive attribute: every \ doubled
+    forward = str(a).replace("\\", "/")
+    out = common.record_session_files("s1", [escaped, forward, a], hermes_home=home)
+    assert len(out) == 1 and os.path.normcase(os.path.normpath(out[0])) == os.path.normcase(os.path.normpath(str(a)))
+    # a manifest written earlier with several spellings of one path folds on the next record
+    manifest = common.session_manifest_path("s1", home)
+    manifest.write_text(json.dumps({"sessionId": "s1", "files": [escaped, str(a), forward]}), encoding="utf-8")
+    b = _md(tmp_path / "docs" / "b.md")
+    merged = common.record_session_files("s1", [b], hermes_home=home)
+    keys = [os.path.normcase(os.path.normpath(f)) for f in merged]
+    assert keys == [os.path.normcase(os.path.normpath(str(b))), os.path.normcase(os.path.normpath(str(a)))]
 
 
 @pytest.mark.parametrize("sid", ["", "   ", "_", None])

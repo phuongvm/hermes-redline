@@ -93,10 +93,9 @@ def _tokens(p: Path, content: str) -> list:
 
 def _resolve(path: str) -> Path:
     # resolve() first: a symlink named .md must not smuggle a non-markdown target
-    try:
-        p = Path(os.path.expanduser(str(path).strip())).resolve(strict=True)
-    except OSError as exc:
-        raise HTTPException(404, f"file not found: {path}") from exc
+    p = common.resolve_existing_file(os.path.expanduser(str(path).strip()))
+    if p is None:  # also finds a file whose OpenSpec change was archived since it was recorded
+        raise HTTPException(404, f"file not found: {path}")
     if p.suffix.lower() not in (common.MD_EXT + common.CODE_EXT):
         raise HTTPException(400, "redline reads Markdown and source files only")
     if not p.is_file():

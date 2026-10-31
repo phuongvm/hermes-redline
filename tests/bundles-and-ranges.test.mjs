@@ -8,7 +8,7 @@ import * as sdk from './stubs/plugin-sdk.mjs'
 
 const plugin = await loadPlugin()
 const { fileBasename, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
-  normalizeFilePath, pathKey, dedupePaths, samePath, MD_EXT, CODE_EXT, parentFolder, groupByFolder, shortFolderLabel } = plugin.internals
+  normalizeFilePath, pathKey, dedupePaths, samePath, MD_EXT, CODE_EXT, parentFolder, groupByFolder, shortFolderLabel, archiveFallbackPath } = plugin.internals
 
 test('normalizeFilePath collapses doubled backslashes and pathKey folds separators and case', () => {
   assert.equal(normalizeFilePath('  O:\\\\\\\\workspaces\\\\\\\\a.md '), 'O:\\workspaces\\a.md')
@@ -266,4 +266,69 @@ test('the active file bar shows the basename with its parent folder and the full
   const text = JSON.stringify(active.props.children)
   assert.match(text, /tasks\.md/)
   assert.match(text, /changes\/a/)
+})
+
+
+// ------------------------------------------------------------------ archived OpenSpec changes
+// Session 20261031_191521_4d8634: files were recorded under openspec/changes/<id>/... and later archived
+// to openspec/changes/archive/<id>/...; the same change also owns openspec/specs/<id>/spec.md.
+
+test('archiveFallbackPath maps changes/<id>/<rest> to changes/archive/<id>/<rest> and keeps the slash style', () => {
+  assert.equal(archiveFallbackPath('O:\\w\\openspec\\changes\\x\\tasks.md'), 'O:\\w\\openspec\\changes\\archive\\x\\tasks.md')
+  assert.equal(archiveFallbackPath('O:/w/openspec/changes/x/specs/x/spec.md'), 'O:/w/openspec/changes/archive/x/specs/x/spec.md')
+  assert.equal(archiveFallbackPath('/w/openspec/changes/x/design.md'), '/w/openspec/changes/archive/x/design.md')
+  assert.equal(archiveFallbackPath('O:\\\\w\\\\openspec\\\\changes\\\\x\\\\tasks.md'), 'O:\\w\\openspec\\changes\\archive\\x\\tasks.md', 'doubled backslashes are normalised first')
+})
+
+test('archiveFallbackPath answers an empty string when there is nothing to fall back to', () => {
+  assert.equal(archiveFallbackPath('O:/w/openspec/changes/archive/x/tasks.md'), '', 'already archived')
+  assert.equal(archiveFallbackPath('O:/w/openspec/specs/x/spec.md'), '', 'not under changes/')
+  assert.equal(archiveFallbackPath('O:/w/openspec/changes/tasks.md'), '', 'no change id segment')
+  assert.equal(archiveFallbackPath(''), '')
+  assert.equal(archiveFallbackPath(null), '')
+})
+
+test('a pre-archive and a post-archive path of one file fold into one entry', () => {
+  const live = 'O:\\w\\openspec\\changes\\x\\tasks.md'
+  const archived = 'O:/w/openspec/changes/archive/x/tasks.md'
+  assert.ok(samePath(live, archived))
+  assert.ok(samePath(live, 'O:/w/openspec/changes/archive/2026-10-31-x/tasks.md'), 'dated archive folder')
+  assert.equal(samePath('O:/w/openspec/changes/x/tasks.md', 'O:/w/openspec/changes/y/tasks.md'), false)
+  assert.deepEqual(dedupePaths([live, archived, 'O:/w/openspec/changes/x/design.md']), [live, 'O:/w/openspec/changes/x/design.md'])
+  assert.equal(groupByFolder([live, archived]).length, 1)
+  assert.deepEqual(groupByFolder([live, archived])[0].files, [live])
+})
+
+const SPEC_LIVE = 'O:\\w\\openspec\\specs\\x\\spec.md'
+const SPEC_DELTA = 'O:\\w\\openspec\\changes\\x\\specs\\x\\spec.md'
+
+test('groupByFolder gives every folder of a bundle its own label, extending colliding two-segment labels', () => {
+  const groups = groupByFolder([SPEC_LIVE, SPEC_DELTA, 'O:/w/openspec/changes/x/tasks.md', 'O:/w/openspec/changes/x/design.md'])
+  assert.equal(groups.length, 3)
+  const labels = groups.map((g) => g.label)
+  assert.equal(new Set(labels.map((l) => l.toLowerCase())).size, 3, `labels must be distinct: ${labels}`)
+  assert.equal(shortFolderLabel(groups[0].folder), shortFolderLabel(groups[1].folder), 'the plain labels did collide')
+  assert.equal(groups[0].label, 'specs/x')
+  assert.equal(groups[1].label, 'changes/x/specs/x')
+  assert.equal(groups[2].label, 'changes/x', 'a folder that never collided keeps its short label')
+})
+
+test('groupByFolder keeps the short label for every folder when none collide', () => {
+  const groups = groupByFolder(['/w/c1/tasks.md', '/w/c2/tasks.md'])
+  assert.deepEqual(groups.map((g) => g.label), groups.map((g) => shortFolderLabel(g.folder)))
+})
+
+test('the browser headers and the active-file directory indicator disambiguate colliding folders', async () => {
+  const { card } = await mountDirective({ file: SPEC_DELTA, file_1: SPEC_LIVE })
+  const [open] = find(card, (n) => n.type === sdk.Button)
+  open.props.onClick()
+  const pane = sdk.host.workspaces.at(-1).render()
+  react.__beginRender()
+  const tree = pane.type(pane.props)
+  const browser = find(tree, (n) => n.props.className === 'rl-browser')[0]
+  const headers = find(browser, (n) => n.props.className === 'rl-folder').map((f) => f.props.children)
+  assert.equal(new Set(headers).size, 2, `distinct headers: ${headers}`)
+  assert.deepEqual(headers, ['changes/x/specs/x', 'specs/x'])
+  const dir = find(tree, (n) => n.props.className === 'rl-active-dir')[0]
+  assert.equal(dir.props.children, 'changes/x/specs/x', 'the active-file bar uses the same disambiguated label')
 })

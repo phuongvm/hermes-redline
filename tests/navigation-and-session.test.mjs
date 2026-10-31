@@ -7,7 +7,7 @@ import * as react from './stubs/react.mjs'
 import * as sdk from './stubs/plugin-sdk.mjs'
 
 const plugin = await loadPlugin()
-const { resolveTargetSession, filterAnnotations, stepThread, pollConditional } = plugin.internals
+const { resolveTargetSession, filterAnnotations, stepThread, pollConditional, resolvedTargetPath } = plugin.internals
 
 const FILE = '/w/review.md'
 const item = (id, status, extra = {}) => ({ id, kind: 'comment', block: 0, quote: `q-${id}`, note: `n-${id}`, status, ...extra })
@@ -539,4 +539,63 @@ test('the session recent query is limited to 32 rows and scoped to the session',
   await options.queryFn()
   assert.deepEqual(urls, ['/recent?limit=32&session_id=session%20A'])
   assert.equal(plugin.internals.recentSessionQuery(probe, '').enabled, false)
+})
+
+
+// ------------------------------------------------------------------ archived OpenSpec changes
+// A document recorded under openspec/changes/<id>/... is later archived to openspec/changes/archive/<id>/...
+
+const LIVE_DOC = 'O:/w/openspec/changes/arch1/tasks.md'
+const ARCHIVED_DOC = 'O:/w/openspec/changes/archive/arch1/tasks.md'
+const docUrl = (path) => `/doc?path=${encodeURIComponent(path)}`
+
+test('pollConditional retries an archived location when the pre-archive path cannot be read, and remembers it', async () => {
+  const cache = new Map()
+  const urls = []
+  const ctx = {
+    rest: async (url) => {
+      urls.push(url)
+      if (url.includes(encodeURIComponent(LIVE_DOC))) throw new Error('404 file not found')
+      return { mtimeNs: 7, unchanged: false, content: 'archived text', path: ARCHIVED_DOC }
+    },
+  }
+  const first = await pollConditional(ctx, cache, `doc:${LIVE_DOC}`, docUrl(LIVE_DOC))
+  assert.equal(first.content, 'archived text')
+  assert.deepEqual(urls, [docUrl(LIVE_DOC), docUrl(ARCHIVED_DOC)])
+  assert.equal(resolvedTargetPath(LIVE_DOC), ARCHIVED_DOC)
+
+  urls.length = 0
+  await pollConditional(ctx, cache, `doc:${LIVE_DOC}`, docUrl(LIVE_DOC))
+  assert.deepEqual(urls, [`${docUrl(ARCHIVED_DOC)}&since_mtime=7`], 'later polls go straight to the archived file')
+})
+
+test('pollConditional rethrows the original error when no archived location answers or none exists', async () => {
+  const boom = new Error('404 original')
+  await assert.rejects(pollConditional({ rest: async () => { throw boom } }, new Map(), 'doc:a', docUrl('O:/w/openspec/changes/zzz/tasks.md')), (e) => e === boom)
+  const urls = []
+  await assert.rejects(pollConditional({ rest: async (u) => { urls.push(u); throw boom } }, new Map(), 'doc:b', docUrl('O:/w/openspec/specs/zzz/spec.md')), (e) => e === boom)
+  assert.equal(urls.length, 1, 'a path with no archive candidate is asked once')
+  assert.equal(resolvedTargetPath('O:/w/openspec/specs/zzz/spec.md'), 'O:/w/openspec/specs/zzz/spec.md', 'unresolved paths resolve to themselves')
+})
+
+test('annotations polling follows the archived path too', async () => {
+  const urls = []
+  const ctx = { rest: async (url) => { urls.push(url); if (url.includes(encodeURIComponent('/changes/arch2/'))) throw new Error('404'); return { mtimeNs: 3, items: [] } } }
+  const res = await pollConditional(ctx, new Map(), 'ann:x', `/annotations?path=${encodeURIComponent('O:/w/openspec/changes/arch2/design.md')}`)
+  assert.deepEqual(res.items, [])
+  assert.equal(urls[1], `/annotations?path=${encodeURIComponent('O:/w/openspec/changes/archive/arch2/design.md')}`)
+})
+
+test('saving annotations posts to the archived file that actually exists', async () => {
+  const live = 'O:/w/openspec/changes/arch3/proposal.md'
+  const archived = 'O:/w/openspec/changes/archive/arch3/proposal.md'
+  const { byId, saves } = await register([item('a', 'open')])
+  await pollConditional({ rest: async (url) => { if (!url.includes('archive')) throw new Error('404'); return { mtimeNs: 1, content: 'x' } } },
+    new Map(), `doc:${live}`, docUrl(live))
+  const [openCard] = find(byId('directive').data.render({ attrs: { file: live }, sessionId: 's' }), (n) => n.type === sdk.Button)
+  openCard.props.onClick()
+  button(renderPane(sdk.host.workspaces.at(-1).render()), 'Resolve all').props.onClick()
+  const [url, call] = saves.at(-1)
+  assert.equal(url, '/annotations')
+  assert.equal(call.body.path, archived)
 })

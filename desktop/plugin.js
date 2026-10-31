@@ -419,9 +419,36 @@ function normalizeFilePath(value) {
   return String(value == null ? '' : value).trim().replace(/\\+/g, '\\')
 }
 
-/** Comparison key of a path: separators and case folded, so `O:\a.md`, `O:\\a.md` and `o:/A.md` agree. */
+/**
+ * Comparison key of a path: separators and case folded, so `O:\a.md`, `O:\\a.md` and `o:/A.md` agree.
+ * An archived OpenSpec location (`changes/archive/[YYYY-MM-DD-]<id>/...`) keys as its pre-archive
+ * `changes/<id>/...`, so one file recorded before and after its change was archived is one entry.
+ */
 function pathKey(value) {
   return normalizeFilePath(value).replace(/\\+/g, '/').toLowerCase()
+    .replace(/\/changes\/archive\/(?:\d{4}-\d{2}-\d{2}-)?([^/]+)(?=\/|$)/, '/changes/$1')
+}
+
+/**
+ * Where an OpenSpec file moves when its change is archived: `.../changes/<id>/<rest>` becomes
+ * `.../changes/archive/<id>/<rest>`, keeping the slash style. '' when there is no such location
+ * (not under `changes/`, no change id, or already archived).
+ */
+function archiveFallbackPath(path) {
+  const text = normalizeFilePath(path)
+  const match = /(^|[\\/])changes([\\/])([^\\/]+)[\\/](?=[^\\/])/.exec(text)
+  if (!match || match[3].toLowerCase() === 'archive') return ''
+  const head = text.slice(0, match.index + match[1].length + 'changes'.length + match[2].length)
+  return `${head}archive${match[2]}${text.slice(head.length)}`
+}
+
+// Where a document was actually read from, by pathKey: the pre-archive path a session still records
+// cannot be read once its change is archived, so the pane asks for (and saves to) the archived file.
+const RESOLVED_TARGETS = new Map()
+
+/** The path to read and write for `path`: the archived location once it was found there, else `path`. */
+function resolvedTargetPath(path) {
+  return RESOLVED_TARGETS.get(pathKey(path)) || path
 }
 
 function samePath(a, b) {
@@ -463,7 +490,11 @@ function shortFolderLabel(folder) {
   return label || (folder ? String(folder) : '.')
 }
 
-/** Documents grouped by folder, folders and files in first-seen order; duplicate basenames stay apart. */
+/**
+ * Documents grouped by folder, folders and files in first-seen order; duplicate basenames stay apart.
+ * Each group carries a `label`: the short two-segment label, except where several folders of the bundle
+ * share it (`specs/x` vs `changes/x/specs/x`) - those are shown relative to their common ancestor.
+ */
 function groupByFolder(files) {
   const groups = []
   const byKey = new Map()
@@ -471,13 +502,36 @@ function groupByFolder(files) {
     const folder = parentFolder(file)
     const key = pathKey(folder)
     if (!byKey.has(key)) {
-      const group = { folder, files: [] }
+      const group = { folder, label: shortFolderLabel(folder), files: [] }
       byKey.set(key, group)
       groups.push(group)
     }
     byKey.get(key).files.push(file)
   })
+  const clashes = new Map()
+  groups.forEach((g) => {
+    const k = g.label.toLowerCase()
+    clashes.set(k, [...(clashes.get(k) || []), g])
+  })
+  clashes.forEach((clash) => {
+    if (clash.length < 2) return
+    const segs = clash.map((g) => g.folder.split('/').filter(Boolean))
+    const limit = Math.min(...segs.map((s) => s.length)) - 1
+    let shared = 0
+    while (shared < limit && segs.every((s) => s[shared].toLowerCase() === segs[0][shared].toLowerCase())) shared += 1
+    clash.forEach((g, i) => { g.label = segs[i].slice(shared).join('/') })
+  })
+  // A trimmed label can still equal another group's label: fall back to the full folder for those.
+  const taken = new Map()
+  groups.forEach((g) => taken.set(g.label.toLowerCase(), (taken.get(g.label.toLowerCase()) || 0) + 1))
+  groups.forEach((g) => { if (taken.get(g.label.toLowerCase()) > 1) g.label = g.folder })
   return groups
+}
+
+/** Label of `folder` among `groups` (from groupByFolder); the short label for a folder outside them. */
+function folderLabelOf(groups, folder) {
+  const group = groups.find((g) => pathKey(g.folder) === pathKey(folder))
+  return group ? group.label : shortFolderLabel(folder)
 }
 
 /**
@@ -605,15 +659,40 @@ function stepThread(ids, currentId, delta) {
 // Last answer per resource, so a poll can ask "has this changed since mtimeNs?" and reuse the data.
 const POLL_CACHE = new Map()
 
+/** `url` with its `path` query value swapped for `path`. */
+function withPath(url, path) {
+  return url.replace(/([?&]path=)[^&]*/, (_m, lead) => `${lead}${encodeURIComponent(path)}`)
+}
+
 /**
  * One poll of /doc or /annotations. Sends `since_mtime` once an answer is cached; an `unchanged`
  * reply returns the cached data untouched, anything else replaces it. `onChange` fires when a
- * cached document's text turns out to differ from the cached text.
+ * cached document's text turns out to differ from the cached text. A path that cannot be read is
+ * retried at its archived OpenSpec location; the location that answers is remembered.
  */
 async function pollConditional(ctx, cache, key, url, onChange) {
   const prev = cache.get(key)
   const useSince = prev && Number.isFinite(prev.mtimeNs)
-  const res = await ctx.rest(useSince ? `${url}${url.includes('?') ? '&' : '?'}since_mtime=${prev.mtimeNs}` : url)
+  const match = /[?&]path=([^&]*)/.exec(url)
+  const path = match ? decodeURIComponent(match[1]) : ''
+  const candidates = path ? [...new Set([resolvedTargetPath(path), path, archiveFallbackPath(path)].filter(Boolean))] : ['']
+  let res
+  let failure = null
+  for (const candidate of candidates) {
+    const target = candidate ? withPath(url, candidate) : url
+    try {
+      res = await ctx.rest(useSince ? `${target}${target.includes('?') ? '&' : '?'}since_mtime=${prev.mtimeNs}` : target)
+      failure = null
+      if (path) {
+        if (candidate === path) RESOLVED_TARGETS.delete(pathKey(path))
+        else RESOLVED_TARGETS.set(pathKey(path), candidate)
+      }
+      break
+    } catch (error) {
+      failure = failure || error
+    }
+  }
+  if (failure) throw failure
   if (res && res.unchanged && prev) return prev.data
   if (res && Number.isFinite(res.mtimeNs)) cache.set(key, { mtimeNs: res.mtimeNs, data: res })
   // Only a different document text is a change worth flagging: a rewritten mtime with the same text is not.
@@ -845,6 +924,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
 
   // Open by default once the chat has two documents; the toggle then decides until the chat changes.
   const browserOpen = browserChoice === null ? bundle.length >= 2 : browserChoice
+  const folderGroups = groupByFolder(bundle)
 
   const docQ = useQuery({
     queryKey: ['redline:doc', active],
@@ -954,7 +1034,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
 
   const save = (next) => {
     const key = ['redline:ann', active]
-    ctx.rest('/annotations', { method: 'POST', body: { path: active, items: next, sessionId: effectiveSessionId || undefined } })
+    ctx.rest('/annotations', { method: 'POST', body: { path: resolvedTargetPath(active), items: next, sessionId: effectiveSessionId || undefined } })
       .then((res) => {
         const previous = annQ.data || {}
         const saved = res && typeof res === 'object' ? res : {}
@@ -1066,14 +1146,14 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
 
   const sendBatch = () => {
     if (!open.length) return
-    if (!submitToTarget(deliveryTarget(), buildBatchMessage(active, open, sidecarPath), !!standalone)) return
+    if (!submitToTarget(deliveryTarget(), buildBatchMessage(resolvedTargetPath(active), open, sidecarPath), !!standalone)) return
     save(items.map((a) => (a.status === 'open' ? { ...a, status: 'sent' } : a)))
     host.notify({ kind: 'info', message: `redline: ${open.length} annotations sent to Hermes` })
   }
   const sendOne = (id, note) => {
     const a = items.find((x) => x.id === id)
     if (!a) return
-    const message = buildBatchMessage(active, [{ ...a, note: note.trim(), draft: undefined }], sidecarPath)
+    const message = buildBatchMessage(resolvedTargetPath(active), [{ ...a, note: note.trim(), draft: undefined }], sidecarPath)
     if (!submitToTarget(deliveryTarget(), message, !!standalone)) return
     save(items.map((x) => (x.id === id ? { ...x, note: note.trim(), draft: undefined, status: 'sent' } : x)))
     setShown(null)
@@ -1091,7 +1171,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
       }) : null,
       active ? jsxs('span', { className: 'rl-active', title: active, children: [
         jsx('b', { children: fileBasename(active) }),
-        parentFolder(active) ? jsx('span', { className: 'rl-active-dir', children: shortFolderLabel(parentFolder(active)) }) : null,
+        parentFolder(active) ? jsx('span', { className: 'rl-active-dir', children: folderLabelOf(folderGroups, parentFolder(active)) }) : null,
       ] }) : null,
       jsx('span', { style: { marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }, children: [
         updated ? jsx(Badge, { variant: 'outline', children: 'Updated' }) : null,
@@ -1101,8 +1181,8 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
         jsx(Button, { size: 'sm', disabled: !open.length, onClick: sendBatch, children: `Send ${open.length || ''} to Hermes` }),
       ] }),
     ] }),
-    bundle.length && browserOpen ? jsx('div', { className: 'rl-browser', children: groupByFolder(bundle).flatMap((group) => [
-      jsx('div', { className: 'rl-folder', title: group.folder, children: shortFolderLabel(group.folder) }, `dir:${pathKey(group.folder)}`),
+    bundle.length && browserOpen ? jsx('div', { className: 'rl-browser', children: folderGroups.flatMap((group) => [
+      jsx('div', { className: 'rl-folder', title: group.folder, children: group.label }, `dir:${pathKey(group.folder)}`),
       ...group.files.map((f) => jsx('button', {
         type: 'button', className: `rl-tab${samePath(f, active) ? ' on' : ''}`, title: f, onClick: () => switchTo(f), children: fileBasename(f),
       }, pathKey(f))),
@@ -1243,7 +1323,7 @@ function Chip({ ctx }) {
 export const internals = {
   locateQuote, spanFromPoints, spanForAnnotation, resolveBlock, stackPositions, mergeBoxes, quantise, sameMarks,
   washBoxes, markerGlyph, resolutionLine, blockMarkerTops, textNodesOf, selectionSpan, rangeIn, submitToTarget,
-  normalizeFilePath, pathKey, dedupePaths, samePath, CSS,
+  normalizeFilePath, pathKey, dedupePaths, samePath, archiveFallbackPath, resolvedTargetPath, folderLabelOf, CSS,
   fileBasename, parentFolder, shortFolderLabel, groupByFolder, recentSessionQuery, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
   resolveTargetSession, filterAnnotations, stepThread, pollConditional, MD_EXT, CODE_EXT,
   rememberSessionFiles, sessionFilesFor, sessionRows, currentFocusedSessionId, SESSION_BUNDLES, $sessionBundles,

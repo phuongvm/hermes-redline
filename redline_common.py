@@ -158,6 +158,62 @@ def resolve_sidecar_mode(mode: str | None = None, *, hermes_home=None, env=None)
     return configured if configured in SIDECAR_MODES else "auto"
 
 
+# --------------------------------------------------------------------------- archived OpenSpec files
+
+def _archive_candidates(path: Path) -> list[Path]:
+    """Where ``.../changes/<id>/<rest>`` lives once its change is archived: ``changes/archive/<id>/<rest>``,
+    or ``changes/archive/<date>-<id>/<rest>`` (newest first). ``[]`` for a path outside a live change."""
+    parts = path.parts
+    at = next((i for i in range(len(parts) - 3, -1, -1) if parts[i].lower() == "changes"), -1)
+    if at < 0 or at + 2 >= len(parts) or parts[at + 1].lower() == "archive":
+        return []
+    change_id, rest = parts[at + 1], Path(*parts[at + 2:])
+    archive = Path(*parts[:at + 1]) / "archive"
+    out = [archive / change_id / rest]
+    try:
+        dated = sorted((d for d in archive.glob("*-" + change_id) if d.is_dir()), key=lambda d: d.name, reverse=True)
+    except OSError:
+        dated = []
+    return out + [d / rest for d in dated]
+
+
+def _pre_archive_paths(path: Path) -> list[Path]:
+    """The live ``changes/<id>/<rest>`` location of an archived ``changes/archive/[<date>-]<id>/<rest>`` file."""
+    parts = path.parts
+    at = next((i for i in range(len(parts) - 3, -1, -1)
+               if parts[i].lower() == "changes" and parts[i + 1].lower() == "archive"), -1)
+    if at < 0:
+        return []
+    folder = parts[at + 2]
+    ids = [folder]
+    dated = re.match(r"\d{4}-\d{2}-\d{2}-(.+)$", folder)
+    if dated:
+        ids.append(dated.group(1))
+    base = Path(*parts[:at + 1])
+    return [base / change_id / Path(*parts[at + 3:]) for change_id in ids]
+
+
+def resolve_existing_file(path) -> Path | None:
+    """The existing file ``path`` names: the path itself first, else its archived OpenSpec location.
+
+    ``None`` when neither exists. A change that was archived after a session recorded its files keeps
+    resolving, so the document still opens.
+    """
+    text = str(path or "").strip()
+    if not text:
+        return None
+    candidate = Path(re.sub(r"\\{2,}", lambda _m: "\\", text)).expanduser()
+    try:
+        if candidate.is_file():
+            return candidate.resolve()
+        for alt in _archive_candidates(candidate):
+            if alt.is_file():
+                return alt.resolve()
+    except (OSError, RuntimeError):
+        return None
+    return None
+
+
 # --------------------------------------------------------------------------- sidecar paths
 
 def find_enclosing_git_root(file_path: Path) -> Path | None:
@@ -208,6 +264,12 @@ def resolve_sidecar_for_read(resolved_file: Path, *, mode: str | None = None, he
         adj = adjacent_sidecar_path(Path(resolved_file))
         if adj.is_file():
             return adj, "adjacent"
+        # The change was archived after the notes were written: they still sit under the pre-archive path.
+        home = resolve_hermes_home(hermes_home, env)
+        for earlier in _pre_archive_paths(Path(resolved_file)):
+            old = central_sidecar_path(earlier, home)
+            if old.is_file():
+                return old, "central"
     return sc, storage
 
 
@@ -365,11 +427,19 @@ def read_session_files(session_id, *, hermes_home=None, env=None) -> list[dict]:
     if not sid:
         return []
     home = resolve_hermes_home(hermes_home, env)
+    manifest = session_manifest_path(sid, home)
+    recorded = _read_manifest_files(manifest)
     rows: list[dict] = []
-    for name in _read_manifest_files(session_manifest_path(sid, home)):
-        target = Path(name)
-        if not target.is_file():
+    healed: list[str] = []
+    for name in recorded:
+        direct = Path(name)
+        target = direct if direct.is_file() else resolve_existing_file(name)
+        if target is None:
+            healed.append(name)  # keep the entry: a temporarily unavailable file is not forgotten
             continue
+        healed.append(name if direct.is_file() else str(target))
+        if any(_path_key(r["path"]) == _path_key(target) for r in rows):
+            continue  # a pre-archive and a post-archive spelling of one file
         sc, _storage = resolve_sidecar_for_read(target, hermes_home=home, env=env)
         items: list = []
         updated_ns = 0
@@ -391,7 +461,19 @@ def read_session_files(session_id, *, hermes_home=None, env=None) -> list[dict]:
             "updatedAt": datetime.fromtimestamp(updated_ns / 1e9, timezone.utc).isoformat(timespec="seconds"),
             "sessionId": sid,
         })
+    healed = _dedupe_paths(healed)
+    if healed != recorded:
+        _persist_healed_manifest(manifest, sid, healed)
     return rows
+
+
+def _persist_healed_manifest(manifest: Path, sid: str, files: list[str]) -> None:
+    """Rewrite a session manifest whose entries moved (archived); a read-only home just keeps the old one."""
+    try:
+        payload = {"sessionId": sid, "updatedAt": _utc_now(), "files": files}
+        _write_text_atomic(manifest, json.dumps(payload, ensure_ascii=False, indent=2))
+    except OSError:
+        pass
 
 
 def list_recent_sidecars(hermes_home, *, limit: int = 12, session_id: str | None = None) -> list[dict]:

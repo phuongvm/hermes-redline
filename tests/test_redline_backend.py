@@ -611,3 +611,97 @@ def test_mtime_unchanged_bounded_float64_predicate(api):
     huge = 2 ** 80                                       # spacing 2**28 ~ 2.7e8 > 1_000_000
     assert float(huge + 2 ** 20) == float(huge)
     assert fn(huge + 2 ** 20, huge) is False             # float-equal but outside the 1_000_000 ns bound
+
+
+# ------------------------------------------------------------------ archived OpenSpec changes
+# Session 20261031_191521_4d8634: files recorded under openspec/changes/<id>/ were archived to
+# openspec/changes/archive/<id>/ (or <date>-<id>/) and every read then failed with "could not read".
+
+def _archive(live: Path, dated: str | None = None) -> Path:
+    """Move ``live`` (.../changes/<id>/<rest>) to .../changes/archive/[<dated>-]<id>/<rest>."""
+    parts = live.parts
+    at = len(parts) - 1 - parts[::-1].index("changes")
+    change_id, rest = parts[at + 1], parts[at + 2:]
+    target = Path(*parts[:at + 1]) / "archive" / ((dated + "-" if dated else "") + change_id) / Path(*rest)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    live.rename(target)
+    return target
+
+
+def test_resolve_existing_file_prefers_the_direct_path_then_the_archive(common, tmp_path):
+    live = _md(tmp_path / "openspec" / "changes" / "c1" / "specs" / "c1" / "spec.md")
+    assert common.resolve_existing_file(live) == live.resolve()
+    archived = _archive(live)
+    assert common.resolve_existing_file(live) == archived.resolve()
+    assert common.resolve_existing_file(str(live)) == archived.resolve()
+    assert common.resolve_existing_file(tmp_path / "openspec" / "changes" / "c9" / "nope.md") is None
+    assert common.resolve_existing_file("") is None
+
+
+def test_resolve_existing_file_finds_date_prefixed_archive_folders(common, tmp_path):
+    live = _md(tmp_path / "openspec" / "changes" / "c2" / "tasks.md")
+    archived = _archive(live, dated="2026-10-31")
+    assert common.resolve_existing_file(live) == archived.resolve()
+
+
+def test_resolve_existing_file_does_not_loop_on_the_archive_folder(common, tmp_path):
+    missing = tmp_path / "openspec" / "changes" / "archive" / "c3" / "tasks.md"
+    assert common.resolve_existing_file(missing) is None
+    assert common.resolve_existing_file(tmp_path / "openspec" / "specs" / "c3" / "spec.md") is None
+
+
+def test_read_session_files_heals_archived_paths_and_persists_the_manifest(common, tmp_path):
+    home = tmp_path / "h"
+    a = _md(tmp_path / "openspec" / "changes" / "c4" / "proposal.md")
+    b = _md(tmp_path / "openspec" / "changes" / "c4" / "design.md")
+    common.record_session_files("sX", [a, b], hermes_home=home)
+    archived_a, archived_b = _archive(a), _archive(b)
+    # an entry for the archived location is already present: both spellings must fold into one row
+    manifest = common.session_manifest_path("sX", home)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["files"].append(str(archived_a.resolve()))
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    rows = common.read_session_files("sX", hermes_home=home)
+    assert sorted(r["path"] for r in rows) == sorted([str(archived_a.resolve()), str(archived_b.resolve())])
+    assert len(rows) == 2
+    healed = json.loads(manifest.read_text(encoding="utf-8"))
+    assert sorted(healed["files"]) == sorted(r["path"] for r in rows)
+    assert healed["sessionId"] == "sX"
+    assert common.read_session_files("sX", hermes_home=home) == rows  # second read is stable
+
+
+def test_resolve_sidecar_for_read_falls_back_to_the_pre_archive_central_sidecar(common, tmp_path):
+    home = tmp_path / "h"
+    live = _md(tmp_path / "openspec" / "changes" / "c5" / "tasks.md")
+    old = _central(common, home, live.resolve(), [{"id": "old", "status": "open"}])
+    archived = _archive(live)
+    sc, storage = common.resolve_sidecar_for_read(archived.resolve(), mode="central", hermes_home=home)
+    assert (sc, storage) == (old, "central")
+    assert common.read_sidecar_items(sc) == [{"id": "old", "status": "open"}]
+    # once the archived file has its own central sidecar, that one wins
+    own = _central(common, home, archived.resolve(), [{"id": "new"}])
+    assert common.resolve_sidecar_for_read(archived.resolve(), mode="central", hermes_home=home) == (own, "central")
+
+
+def test_api_reads_and_saves_through_the_archived_location(api, common, tmp_path, monkeypatch):
+    monkeypatch.setenv("REDLINE_SIDECAR_MODE", "central")
+    live = _md(tmp_path / "openspec" / "changes" / "c6" / "proposal.md")
+    _central(common, api.home, live.resolve(), [{"id": "old", "status": "open"}])
+    archived = _archive(live)
+
+    doc = api.get("/doc", params={"path": str(live)})
+    assert doc.status_code == 200 and Path(doc.json()["path"]) == archived.resolve()
+    ann = api.get("/annotations", params={"path": str(live)}).json()
+    assert ann["items"] == [{"id": "old", "status": "open"}]
+
+    saved = api.post("/annotations", json={"path": str(live), "items": ann["items"] + [{"id": "n"}], "sessionId": "sA"}).json()
+    assert saved["ok"] is True
+    assert saved["sidecarPath"] == str(common.central_sidecar_path(archived.resolve(), api.home))
+    assert api.get("/doc", params={"path": str(tmp_path / "openspec" / "changes" / "gone" / "x.md")}).status_code == 404
+
+
+def test_resolve_existing_file_collapses_json_escaped_backslashes(common, tmp_path):
+    live = _md(tmp_path / "openspec" / "changes" / "c7" / "tasks.md")
+    escaped = str(live).replace("\\", "\\\\")
+    assert common.resolve_existing_file(escaped) == live.resolve()

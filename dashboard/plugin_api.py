@@ -152,10 +152,11 @@ def save_annotations(body: dict):
         raise HTTPException(413, "too many/too large annotations")
     sc, storage = common.resolve_sidecar(p)
     # ponytail: replace is atomic on one filesystem; add locking only if concurrent editors matter.
-    common.write_sidecar_atomic(sc, items, target_file=p, storage=storage)
+    session_id = str(body.get("sessionId") or body.get("session_id") or "").strip() or None
+    common.write_sidecar_atomic(sc, items, target_file=p, storage=storage, session_id=session_id)
     return {"ok": True, "count": len(items), "sidecarPath": str(sc), "storage": storage, "mtimeNs": _mtime_ns(sc)}
 
 
 @router.get("/recent")
-def recent(limit: int = Query(12, ge=1, le=50)):
-    return {"items": common.list_recent_sidecars(common.resolve_hermes_home(), limit=limit)}
+def recent(limit: int = Query(12, ge=1, le=50), session_id: str | None = Query(None)):
+    return {"items": common.list_recent_sidecars(common.resolve_hermes_home(), limit=limit, session_id=session_id)}

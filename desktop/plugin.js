@@ -629,33 +629,151 @@ function Card({ a, draftText, onDraftText, onSaveDraft, onSend, onCancelDraft, o
   ] })
 }
 
+// The chat the user is looking at: the stored id (what a directive's sessionId carries), else the runtime
+// id, else the active runtime id. Read-only atoms; an older host without one of them is skipped.
+const SESSION_ATOMS = ['focusedStoredSessionId', 'focusedSessionId', 'activeSessionId']
+const NO_SESSION = atom('')
+const sessionAtom = (name) => (host.state && host.state[name]) || NO_SESSION
+
 function currentFocusedSessionId() {
-  try {
-    const atomRef = host.state && host.state.focusedSessionId
-    const value = atomRef ? atomRef.get() : ''
-    return value ? String(value) : ''
-  } catch (error) {
-    return ''
+  for (const name of SESSION_ATOMS) {
+    try {
+      const value = sessionAtom(name).get()
+      if (value) return String(value)
+    } catch (error) {
+      // try the next atom
+    }
   }
+  return ''
+}
+
+// Reviewable documents per chat session. SESSION_BUNDLES is the live view, session-files:<id> in ctx.storage
+// is its persisted copy, and $sessionBundles re-renders any open pane when a chat gains a document.
+const MAX_SESSION_FILES = 32
+const SESSION_BUNDLES = new Map()
+const $sessionBundles = atom({})
+
+const isReviewable = (path) => hasExt(path, MD_EXT) || hasExt(path, CODE_EXT)
+
+function storedSessionFiles(ctx, sessionId) {
+  let stored = []
+  try { stored = ctx.storage.get(`session-files:${sessionId}`) } catch (error) { stored = [] }
+  return [...new Set([...(SESSION_BUNDLES.get(sessionId) || []), ...(Array.isArray(stored) ? stored : [])])]
+}
+
+/** Record `files` as documents of `sessionId`. Files already known keep their place; new ones lead. */
+function rememberSessionFiles(ctx, sessionId, files) {
+  const sid = String(sessionId || '').trim()
+  if (!sid) return []
+  const previous = storedSessionFiles(ctx, sid)
+  const fresh = [...new Set((files || []).map((f) => String(f == null ? '' : f).trim()).filter((f) => f && isReviewable(f)))]
+    .filter((f) => !previous.includes(f))
+  if (!fresh.length) return previous
+  const next = [...fresh, ...previous].slice(0, MAX_SESSION_FILES)
+  SESSION_BUNDLES.set(sid, next)
+  try { ctx.storage.set(`session-files:${sid}`, next) } catch (error) { /* storage is best effort */ }
+  // Deferred: a directive registers while the transcript renders, and an atom set then would update the pane mid-render.
+  queueMicrotask(() => $sessionBundles.set({ ...$sessionBundles.get(), [sid]: next }))
+  return next
+}
+
+/** Backend rows that belong to `sessionId`. The backend filters too; this keeps an older gateway from leaking. */
+function sessionRows(rows, sessionId) {
+  if (!sessionId) return []
+  return (Array.isArray(rows) ? rows : []).filter((r) => r && (r.sessionId === sessionId
+    || (Array.isArray(r.sessions) && r.sessions.includes(sessionId))))
+}
+
+/** Ordered, de-duplicated documents of one session: registered directives, persisted copy, then the backend's rows. */
+function sessionFilesFor(ctx, sessionId, centralRecent) {
+  if (!sessionId) return []
+  const fromBackend = sessionRows(centralRecent, sessionId).map((r) => r.path).filter(Boolean)
+  return [...new Set([...storedSessionFiles(ctx, sessionId), ...fromBackend])]
 }
 
 const FILTERS = [['all', 'All'], ['open', 'Open'], ['sent', 'Sent'], ['resolved', 'Resolved']]
 
 function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
-  const bundle = Array.isArray(files) && files.length ? files : (file ? [file] : [])
-  const first = bundle[0] || ''
-  const [path, setPath] = useState(first)
-  const [active, setActive] = useState(first)
+  const explicit = Array.isArray(files) && files.length ? files : (file ? [file] : [])
+  const first = explicit[0] || ''
+
+  // Which chat this pane shows. A card pins its own chat until the user switches chats; a standalone pane
+  // always follows the focused one. The atoms are subscribed, so a chat switch re-renders the pane.
+  const storedFocus = useValue(sessionAtom('focusedStoredSessionId'))
+  const runtimeFocus = useValue(sessionAtom('focusedSessionId'))
+  const activeFocus = useValue(sessionAtom('activeSessionId'))
+  useValue($sessionBundles)
+  const focusedSession = String(storedFocus || runtimeFocus || activeFocus || '')
+
+  const [pathState, setPath] = useState(first)
+  const [activeState, setActive] = useState(first)
   const [draftText, setDraftText] = useState('')
   const [pill, setPill] = useState(null)
   const [shown, setShown] = useState(null)
   const [marks, setMarks] = useState({})
   const [rebound, setRebound] = useState('')
+  const [initialFocused] = useState(focusedSession)
+  const [lastFocused, setLastFocused] = useState(focusedSession)
+  const [seenSession, setSeenSession] = useState(null)
   const [filter, setFilter] = useState('all')
   const [updated, setUpdated] = useState(false)
+
+  // "Bind to active chat" only lasts while that chat stays focused.
+  let reboundNow = rebound
+  if (lastFocused !== focusedSession) {
+    setLastFocused(focusedSession)
+    if (rebound) setRebound('')
+    reboundNow = ''
+  }
+  // A card pins its chat until the user opens another one; a standalone pane always follows the focused chat.
+  const followed = !standalone && focusedSession && focusedSession !== initialFocused ? focusedSession : ''
+  // Whose documents the pane shows and whose recent files and sidecars it records.
+  const effectiveSessionId = standalone ? focusedSession : (followed || targetSessionId || '')
+  // Where a batch is delivered: an explicit re-bind wins, else the chat the pane shows.
+  const deliverySessionId = followed
+    ? (reboundNow || followed)
+    : resolveTargetSession({
+      pinnedSessionId: targetSessionId, reboundSessionId: reboundNow, focusedSessionId: focusedSession, standalone: !!standalone,
+    })
   const measureRef = useRef(null)
   const docRef = useRef(null)
   const mainRef = useRef(null)
+
+  const recentQ = useQuery({
+    queryKey: ['redline:recent', effectiveSessionId],
+    queryFn: () => ctx.rest(`/recent?limit=12&session_id=${encodeURIComponent(effectiveSessionId)}`),
+    enabled: !!effectiveSessionId, retry: false, refetchInterval: 5000,
+  })
+  const centralRecent = sessionRows(recentQ.data && recentQ.data.items, effectiveSessionId)
+  const sessionBundle = sessionFilesFor(ctx, effectiveSessionId, centralRecent)
+  // The card's own files belong to its chat (or to a detached card); another chat never inherits them.
+  const cardOwned = !standalone && (!effectiveSessionId || effectiveSessionId === targetSessionId)
+  const bundle = cardOwned ? [...new Set([...explicit, ...sessionBundle])] : sessionBundle
+
+  // Reconcile the open document with the session in view, during render so no frame shows another chat's
+  // file: a chat switch lands on that chat's first document, or on the empty state when it has none.
+  let path = pathState
+  let active = activeState
+  if (seenSession !== effectiveSessionId) {
+    setSeenSession(effectiveSessionId)
+    const landing = bundle[0] || ''
+    if (seenSession !== null || landing !== active) {
+      active = landing
+      path = landing
+      setActive(landing)
+      setPath(landing)
+    }
+    if (seenSession !== null) {
+      setShown(null)
+      setPill(null)
+      setUpdated(false)
+    }
+  } else if (!active && bundle.length) {
+    active = bundle[0]
+    path = bundle[0]
+    setActive(bundle[0])
+    setPath(bundle[0])
+  }
 
   const docQ = useQuery({
     queryKey: ['redline:doc', active],
@@ -667,11 +785,6 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
     queryFn: () => pollConditional(ctx, POLL_CACHE, `ann:${active}`, `/annotations?path=${encodeURIComponent(active)}`),
     enabled: !!active, retry: false, refetchInterval: 3000,
   })
-  const recentQ = useQuery({
-    queryKey: ['redline:recent'],
-    queryFn: () => ctx.rest('/recent?limit=8'),
-    enabled: !!standalone && !active, retry: false, refetchInterval: 5000,
-  })
 
   const items = (annQ.data && annQ.data.items) || []
   const sidecarPath = (annQ.data && annQ.data.sidecarPath) || ''
@@ -679,7 +792,6 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
   const filtered = filterAnnotations(items, filter)
   const visible = items.filter((a) => a.draft || filtered.includes(a))
   const unresolved = items.filter((a) => !a.draft && a.status !== 'resolved')
-  const centralRecent = (recentQ.data && recentQ.data.items) || []
   useEffect(() => {
     $openCount.set(open.length)
     return () => $openCount.set(0)
@@ -776,7 +888,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
 
   const save = (next) => {
     const key = ['redline:ann', active]
-    ctx.rest('/annotations', { method: 'POST', body: { path: active, items: next } })
+    ctx.rest('/annotations', { method: 'POST', body: { path: active, items: next, sessionId: effectiveSessionId || undefined } })
       .then((res) => {
         const previous = annQ.data || {}
         const saved = res && typeof res === 'object' ? res : {}
@@ -833,12 +945,9 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
     setRebound(focused)
     host.notify({ kind: 'info', message: 'redline: bound to the active chat' })
   }
-  const deliveryTarget = () => resolveTargetSession({
-    pinnedSessionId: targetSessionId,
-    reboundSessionId: rebound,
-    focusedSessionId: standalone ? currentFocusedSessionId() : '',
-    standalone: !!standalone,
-  })
+  const deliveryTarget = () => (standalone
+    ? resolveTargetSession({ reboundSessionId: reboundNow, focusedSessionId: currentFocusedSessionId(), standalone: true })
+    : deliverySessionId)
 
   const onMouseUp = () => {
     const sel = window.getSelection()
@@ -910,10 +1019,13 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
     const p = path.trim()
     if (!p) return
     switchTo(p)
-    const recent = (ctx.storage.get('recent') || []).filter((x) => x !== p)
-    ctx.storage.set('recent', [p, ...recent].slice(0, 6))
+    if (!effectiveSessionId) return // no chat in view: nothing to attribute the file to, so nothing is remembered
+    const key = `recent:${effectiveSessionId}`
+    const earlier = (ctx.storage.get(key) || []).filter((x) => x !== p)
+    ctx.storage.set(key, [p, ...earlier].slice(0, 6))
+    rememberSessionFiles(ctx, effectiveSessionId, [p])
   }
-  const recent = ctx.storage.get('recent') || []
+  const recent = effectiveSessionId ? (ctx.storage.get(`recent:${effectiveSessionId}`) || []) : []
 
   return jsxs('div', { className: 'rl-root', children: [
     jsxs('div', { className: 'rl-head', children: [
@@ -925,7 +1037,7 @@ function RedlinePane({ ctx, file, files, targetSessionId, standalone }) {
       jsx('span', { style: { marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }, children: [
         updated ? jsx(Badge, { variant: 'outline', children: 'Updated' }) : null,
         !standalone ? jsx(Button, { size: 'sm', variant: 'ghost', title: 'Send this review to the chat that is open now', onClick: bindToActiveChat, children: 'Bind to active chat' }) : null,
-        rebound ? jsx(Badge, { variant: 'outline', children: 'bound to active chat' }) : null,
+        reboundNow ? jsx(Badge, { variant: 'outline', children: 'bound to active chat' }) : null,
         open.length ? jsx(Badge, { variant: 'outline', children: `${open.length} open` }) : null,
         jsx(Button, { size: 'sm', disabled: !open.length, onClick: sendBatch, children: `Send ${open.length || ''} to Hermes` }),
       ] }),
@@ -1063,6 +1175,7 @@ export const internals = {
   washBoxes, markerGlyph, resolutionLine, blockMarkerTops, textNodesOf, selectionSpan, rangeIn, submitToTarget,
   fileBasename, parseBundleFiles, splitMarkdownBlocks, codeSelectionFromRange, buildBatchMessage, isRangeItem,
   resolveTargetSession, filterAnnotations, stepThread, pollConditional, MD_EXT, CODE_EXT,
+  rememberSessionFiles, sessionFilesFor, sessionRows, currentFocusedSessionId, SESSION_BUNDLES, $sessionBundles,
 }
 export const __test = internals
 
@@ -1074,6 +1187,8 @@ export default {
     style.textContent = CSS
     document.head.appendChild(style)
     ctx.onDispose(() => style.remove())
+    SESSION_BUNDLES.clear()
+    $sessionBundles.set({})
 
     ctx.registerMany([
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 130, render: () => jsx(Chip, { ctx }) },
@@ -1097,6 +1212,7 @@ export default {
           render: ({ attrs, sessionId }) => {
             const bundleFiles = parseBundleFiles(attrs || {})
             if (!bundleFiles.length) return null
+            rememberSessionFiles(ctx, sessionId, bundleFiles) // this chat now owns these documents
             const lead = bundleFiles[0]
             return jsxs('div', {
               className: 'rl-card', style: { '--rl-line': 'var(--ui-red)', maxWidth: 460 }, children: [

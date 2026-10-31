@@ -234,25 +234,63 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def write_sidecar_atomic(sc: Path, items: list, *, target_file: Path, storage: str) -> None:
-    """Replace ``sc`` atomically. Central sidecars (and existing envelopes) are enveloped; others stay bare lists."""
+def write_sidecar_atomic(sc: Path, items: list, *, target_file: Path, storage: str, session_id: str | None = None) -> None:
+    """Replace ``sc`` atomically. Central sidecars (and existing envelopes) are enveloped; others stay bare lists.
+
+    An envelope records the sessions that saved annotations on it (``"sessions"``): existing owners are kept
+    and ``session_id`` is appended, so a later save with no session never drops the owners.
+    """
     sc = Path(sc)
     envelope = storage == "central"
-    if not envelope and sc.is_file():
+    existing: dict = {}
+    if sc.is_file():
         try:
-            envelope = _parse_sidecar(sc)[1]
-        except ValueError:
-            envelope = False
-    payload = (
-        {"file": str(target_file), "updatedAt": _utc_now(), "items": items} if envelope else items
-    )
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
-    sc.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=f".{sc.name}.", suffix=".tmp", dir=sc.parent, text=True)
+            existing_data = json.loads(sc.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing_data = None
+        if isinstance(existing_data, dict) and isinstance(existing_data.get("items"), list):
+            existing = existing_data
+            envelope = True
+    sid = _clean_session_id(session_id)
+    if envelope:
+        payload = {"file": str(target_file), "updatedAt": _utc_now(), "items": items}
+        sessions = [s for s in existing.get("sessions", []) if isinstance(s, str)]
+        if sid and sid not in sessions:
+            sessions.append(sid)
+        if sessions:
+            payload["sessions"] = sessions
+    else:
+        payload = items
+    _write_text_atomic(sc, json.dumps(payload, ensure_ascii=False, indent=2))
+    if envelope and sid and storage == "central":
+        record_session_files(sid, [target_file], hermes_home=sc.parent.parent.parent)
+
+
+# --------------------------------------------------------------------------- session manifests
+
+MAX_SESSION_FILES = 32
+
+
+def _clean_session_id(session_id) -> str:
+    """The usable session id, or ``""`` for blank / the ``_`` placeholder of an unbound turn."""
+    sid = str(session_id or "").strip()
+    return "" if sid == "_" else sid
+
+
+def session_manifest_path(session_id: str, hermes_home) -> Path:
+    key = str(session_id)
+    sha16 = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", key)[:80]
+    return Path(hermes_home) / "redline" / "sessions" / f"{sha16}-{safe}.json"
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        os.replace(temp_path, sc)
+        os.replace(temp_path, path)
     except BaseException:
         try:
             os.unlink(temp_path)
@@ -261,14 +299,104 @@ def write_sidecar_atomic(sc: Path, items: list, *, target_file: Path, storage: s
         raise
 
 
-def list_recent_sidecars(hermes_home, *, limit: int = 12) -> list[dict]:
-    """Newest centralized sidecars whose target file still exists, with per-status counts."""
+def _read_manifest_files(manifest: Path) -> list[str]:
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    files = data.get("files") if isinstance(data, dict) else None
+    return [f for f in files if isinstance(f, str)] if isinstance(files, list) else []
+
+
+def record_session_files(session_id, files, *, hermes_home=None, env=None) -> list[str]:
+    """Remember reviewable ``files`` for ``session_id``: newest first, de-duplicated, capped at 32.
+
+    Blank / ``_`` sessions, missing files, non-reviewable extensions and auto-card exclusions are ignored.
+    Returns the full manifest, or ``[]`` when the session is unbound.
+    """
+    sid = _clean_session_id(session_id)
+    if not sid:
+        return []
+    fresh: list[str] = []
+    for raw in files or []:
+        try:
+            p = Path(str(raw)).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        text = str(p)
+        if text not in fresh and p.is_file() and has_reviewable_ext(p) and not skip_auto_card_path(p):
+            fresh.append(text)
+    manifest = session_manifest_path(sid, resolve_hermes_home(hermes_home, env))
+    previous = _read_manifest_files(manifest)
+    if not fresh:
+        return previous
+    merged = (fresh + [f for f in previous if f not in fresh])[:MAX_SESSION_FILES]
+    payload = {"sessionId": sid, "updatedAt": _utc_now(), "files": merged}
+    _write_text_atomic(manifest, json.dumps(payload, ensure_ascii=False, indent=2))
+    return merged
+
+
+def _status_counts(items: list) -> dict:
+    live = [a for a in items if isinstance(a, dict) and not a.get("draft")]
+    count = lambda status: sum(1 for a in live if a.get("status") == status)  # noqa: E731
+    return {"openCount": count("open"), "sentCount": count("sent"), "resolvedCount": count("resolved")}
+
+
+def read_session_files(session_id, *, hermes_home=None, env=None) -> list[dict]:
+    """The session's recorded files that still exist, with live annotation counts (zero before any annotation)."""
+    sid = _clean_session_id(session_id)
+    if not sid:
+        return []
+    home = resolve_hermes_home(hermes_home, env)
+    rows: list[dict] = []
+    for name in _read_manifest_files(session_manifest_path(sid, home)):
+        target = Path(name)
+        if not target.is_file():
+            continue
+        sc, _storage = resolve_sidecar_for_read(target, hermes_home=home, env=env)
+        items: list = []
+        updated_ns = 0
+        if sc.is_file():
+            try:
+                items = read_sidecar_items(sc)
+                updated_ns = sc.stat().st_mtime_ns
+            except (ValueError, OSError):
+                items = []
+        if not updated_ns:
+            try:
+                updated_ns = target.stat().st_mtime_ns
+            except OSError:
+                updated_ns = 0
+        rows.append({
+            "path": str(target),
+            "sidecarPath": str(sc) if sc.is_file() else "",
+            **_status_counts(items),
+            "updatedAt": datetime.fromtimestamp(updated_ns / 1e9, timezone.utc).isoformat(timespec="seconds"),
+            "sessionId": sid,
+        })
+    return rows
+
+
+def list_recent_sidecars(hermes_home, *, limit: int = 12, session_id: str | None = None) -> list[dict]:
+    """Newest centralized sidecars whose target file still exists, with per-status counts.
+
+    ``session_id=None`` is the unfiltered legacy listing. A supplied ``session_id`` returns only that
+    session's documents (its recorded files first, then sidecars it annotated), each stamped with
+    ``sessionId``; a blank or ``_`` id, and a session with nothing, return ``[]``.
+    """
+    scoped = session_id is not None
+    sid = _clean_session_id(session_id) if scoped else ""
+    if scoped and not sid:
+        return []
+    out: list[dict] = read_session_files(sid, hermes_home=hermes_home)[:limit] if scoped else []
+    seen = {os.path.normcase(r["path"]) for r in out}
+    if len(out) >= limit:
+        return out
     root = Path(hermes_home) / "redline" / "annotations"
     try:
         entries = [(p.stat().st_mtime_ns, p) for p in root.glob("*" + SIDECAR_SUFFIX) if p.is_file()]
     except OSError:
-        return []
-    out: list[dict] = []
+        return out
     for mtime_ns, sc in sorted(entries, key=lambda e: e[0], reverse=True):
         try:
             data = json.loads(sc.read_text(encoding="utf-8"))
@@ -276,19 +404,21 @@ def list_recent_sidecars(hermes_home, *, limit: int = 12) -> list[dict]:
             continue
         if not (isinstance(data, dict) and isinstance(data.get("items"), list) and data.get("file")):
             continue
-        target = Path(str(data["file"]))
-        if not target.is_file():
+        if scoped and sid not in (data.get("sessions") or []):
             continue
-        items = [a for a in data["items"] if isinstance(a, dict)]
-        count = lambda status: sum(1 for a in items if a.get("status") == status and not a.get("draft"))  # noqa: E731
-        out.append({
+        target = Path(str(data["file"]))
+        if not target.is_file() or (scoped and os.path.normcase(str(target)) in seen):
+            continue
+        seen.add(os.path.normcase(str(target)))
+        row = {
             "path": str(target),
             "sidecarPath": str(sc),
-            "openCount": count("open"),
-            "sentCount": count("sent"),
-            "resolvedCount": count("resolved"),
+            **_status_counts(data["items"]),
             "updatedAt": str(data.get("updatedAt") or datetime.fromtimestamp(mtime_ns / 1e9, timezone.utc).isoformat(timespec="seconds")),
-        })
+        }
+        if scoped:
+            row["sessionId"] = sid
+        out.append(row)
         if len(out) >= limit:
             break
     return out

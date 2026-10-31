@@ -37,6 +37,7 @@ MD_EXT = _common.MD_EXT
 CODE_EXT = _common.CODE_EXT
 
 _DIRECTIVE_RE = re.compile(r"::redline\{")
+_DIRECTIVE_FILE_RE = re.compile(r'\bfile(?:_\d+)?\s*=\s*"([^"\n]*)"')
 # ponytail: path heuristics instead of a config knob; add config_schema if users want opt-out granularity.
 _MIN_BYTES = 200
 MAX_BUNDLE_FILES = 8
@@ -62,6 +63,11 @@ def _eligible(path: str) -> bool:
     return True
 
 
+def _directive_files(text: str) -> list[str]:
+    """Quoted ``file`` / ``file_N`` values of the ::redline directives in ``text``."""
+    return [m.group(1) for m in _DIRECTIVE_FILE_RE.finditer(text)]
+
+
 def _post_tool_call(tool_name: str, args: dict, result, session_id: str = "", **kwargs):
     try:
         # post_tool_call dispatch (model_tools.py) carries no platform kwarg; gating it here
@@ -76,6 +82,7 @@ def _post_tool_call(tool_name: str, args: dict, result, session_id: str = "", **
         bucket = _written.setdefault(session_id or "_", [])
         if resolved not in bucket and len(bucket) < MAX_BUNDLE_FILES:
             bucket.append(resolved)
+        _common.record_session_files(session_id, [resolved])
     except Exception:
         pass  # observers must never break a turn
 
@@ -85,14 +92,19 @@ def _transform_llm_output(response_text: str, session_id: str = "", **kwargs):
         if kwargs.get("platform") != "desktop":
             return None
         paths = _written.pop(session_id or "_", None)
-        if not response_text or not paths:
+        if not response_text:
             return None
         # A literal directive quoted inside a fenced block is documentation, not a card.
-        if _DIRECTIVE_RE.search(strip_fenced_code(response_text)):
+        top_level = strip_fenced_code(response_text)
+        if _DIRECTIVE_RE.search(top_level):
+            _common.record_session_files(session_id, _directive_files(top_level))
+            return None
+        if not paths:
             return None
         paths = [p for p in paths if Path(p).is_file()]
         if not paths:
             return None
+        _common.record_session_files(session_id, paths)  # bundle order leads the session manifest
         # ensure_ascii=False: the desktop directive parser reads attribute values
         # verbatim (no JSON unescape), so \uXXXX escapes would reach the redline
         # backend as literal text and 404 on any non-ASCII path.

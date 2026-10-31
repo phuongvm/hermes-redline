@@ -185,3 +185,181 @@ test('pollConditional sends since_mtime once cached, reuses data on unchanged an
   assert.deepEqual(urls, ['/doc?path=%2Fa', '/doc?path=%2Fa&since_mtime=5', '/doc?path=%2Fa&since_mtime=5'])
   assert.equal(changed, 1, 'only the real change fires onChange; the first load does not')
 })
+
+
+// ------------------------------------------------------------------ session-scoped documents
+
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+
+async function registerScoped({ recent = [], items = [] } = {}) {
+  sdk.__reset()
+  react.__reset()
+  sdk.__setQueryResult('redline:doc', { content: '# T\n\nBody.\n' })
+  sdk.__setQueryResult('redline:ann', { items, sidecarPath: '/home/.hermes/redline/annotations/x.redline.json' })
+  sdk.__setQueryResult('redline:recent', { items: recent })
+  globalThis.document ??= { createElement: () => ({ remove() {} }), head: { appendChild() {} } }
+  let entries = []
+  const calls = []
+  const store = new Map()
+  const ctx = {
+    rest: async (...args) => { calls.push(args); return {} },
+    storage: { get: (key) => store.get(key), set: (key, value) => { store.set(key, value) } },
+    onDispose() {},
+    registerMany(next) { entries = next },
+  }
+  plugin.default.register(ctx)
+  const byId = (id) => entries.find((entry) => entry.id === id)
+  return { ctx, calls, store, byId, directive: byId('directive').data.render, standalone: byId('page') }
+}
+
+const shownPath = (tree) => (find(tree, (n) => n.props.className === 'rl-path' && n.props.title)[0] || { props: {} }).props.title || ''
+const tabTitles = (tree) => find(tree, (n) => typeof n.props.className === 'string' && n.props.className.startsWith('rl-tab') && n.props.title).map((n) => n.props.title)
+const emptyText = (tree) => find(tree, (n) => n.props.className === 'rl-empty').map((n) => JSON.stringify(n.props.children)).join('|')
+const recentChips = (tree) => find(tree, (n) => n.props.className === 'rl-chip' && n.type === sdk.Button).map((n) => n.key)
+
+test('a ::redline directive registers its files against the chat that rendered it', async () => {
+  const { directive, store, ctx } = await registerScoped()
+  directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md' }, sessionId: 'session-A' })
+  directive({ attrs: { file: '/B/docB.md' }, sessionId: 'session-B' })
+  directive({ attrs: { file: '/A/doc1.md' }, sessionId: null })
+  await flush()
+  assert.deepEqual(plugin.internals.SESSION_BUNDLES.get('session-A'), ['/A/doc1.md', '/A/doc2.md'])
+  assert.deepEqual(store.get('session-files:session-A'), ['/A/doc1.md', '/A/doc2.md'])
+  assert.deepEqual(plugin.internals.SESSION_BUNDLES.get('session-B'), ['/B/docB.md'])
+  assert.deepEqual(plugin.internals.$sessionBundles.get()['session-A'], ['/A/doc1.md', '/A/doc2.md'])
+  assert.deepEqual(plugin.internals.sessionFilesFor(ctx, 'session-A', []), ['/A/doc1.md', '/A/doc2.md'])
+  assert.deepEqual(plugin.internals.sessionFilesFor(ctx, '', []), [])
+})
+
+test('the side pane shows the focused chat documents and switches when the chat changes', async () => {
+  const { directive, standalone } = await registerScoped()
+  directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md' }, sessionId: 'session-A' })
+  directive({ attrs: { file: '/B/docB.md' }, sessionId: 'session-B' })
+  await flush()
+  const pane = standalone.render()
+
+  sdk.host.focusedStoredSessionId = 'session-A'
+  let tree = renderPane(pane)
+  assert.equal(shownPath(tree), '/A/doc1.md')
+  assert.deepEqual(tabTitles(tree), ['/A/doc1.md', '/A/doc2.md'])
+
+  sdk.host.focusedStoredSessionId = 'session-B'
+  tree = renderPane(pane)
+  assert.equal(shownPath(tree), '/B/docB.md')
+  assert.ok(!tabTitles(tree).some((t) => t.startsWith('/A/')), 'no tab of the other chat')
+  sendButton(tree).props.onClick?.()
+})
+
+test('switching to a chat with no documents clears the pane and leaks nothing from other chats', async () => {
+  const stray = [
+    { path: '/old/redline_cutover.py', sidecarPath: '/h/1.json', openCount: 0 },
+    { path: '/old/spec.md', sidecarPath: '/h/2.json', openCount: 0, sessionId: 'session-A' },
+  ]
+  const { directive, standalone, store } = await registerScoped({ recent: stray })
+  store.set('recent', ['/legacy/global.md'])
+  directive({ attrs: { file: '/A/docA.md' }, sessionId: 'session-A' })
+  await flush()
+  const pane = standalone.render()
+
+  sdk.host.focusedStoredSessionId = 'session-A'
+  assert.equal(shownPath(renderPane(pane)), '/A/docA.md')
+
+  sdk.host.focusedStoredSessionId = 'session-empty'
+  const tree = renderPane(pane)
+  assert.equal(shownPath(tree), '', 'active document cleared')
+  assert.deepEqual(tabTitles(tree), [])
+  assert.deepEqual(recentChips(tree), [], 'global recent chips are never shown')
+  assert.doesNotMatch(emptyText(tree), /redline_cutover|spec\.md|docA|global\.md|Recently annotated/)
+  const input = find(tree, (n) => n.type === sdk.Input)[0]
+  assert.equal(input.props.value, '', 'path box cleared too')
+
+  sdk.host.focusedStoredSessionId = 'session-A'
+  assert.equal(shownPath(renderPane(pane)), '/A/docA.md', 'switching back restores the chat documents')
+})
+
+test('the pane follows the runtime and active session ids when no stored id is focused', async () => {
+  const { directive, standalone } = await registerScoped()
+  directive({ attrs: { file: '/R/run.md' }, sessionId: 'runtime-1' })
+  directive({ attrs: { file: '/C/act.md' }, sessionId: 'active-1' })
+  await flush()
+  const pane = standalone.render()
+  sdk.host.focusedSessionId = 'runtime-1'
+  assert.equal(shownPath(renderPane(pane)), '/R/run.md')
+  assert.equal(plugin.internals.currentFocusedSessionId(), 'runtime-1')
+  sdk.host.focusedSessionId = ''
+  sdk.host.activeSessionId = 'active-1'
+  assert.equal(shownPath(renderPane(pane)), '/C/act.md')
+  sdk.host.focusedStoredSessionId = 'stored-wins'
+  assert.equal(plugin.internals.currentFocusedSessionId(), 'stored-wins')
+})
+
+test('a card-opened pane keeps its own documents until the user switches chats, then follows the new chat', async () => {
+  const { directive, byId } = await registerScoped()
+  sdk.host.focusedStoredSessionId = 'session-A'
+  directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md' }, sessionId: 'session-A' })
+  directive({ attrs: { file: '/B/docB.md' }, sessionId: 'session-B' })
+  await flush()
+  const [openCard] = find(directive({ attrs: { file: '/A/doc1.md', file_1: '/A/doc2.md' }, sessionId: 'session-A' }), (n) => n.type === sdk.Button)
+  openCard.props.onClick()
+  const carded = sdk.host.workspaces.at(-1).render()
+
+  let tree = renderPane(carded)
+  assert.equal(shownPath(tree), '/A/doc1.md')
+  sendButton(tree).props.onClick?.()
+
+  sdk.host.focusedStoredSessionId = 'session-B'
+  tree = renderPane(carded)
+  assert.equal(shownPath(tree), '/B/docB.md')
+  assert.ok(!tabTitles(tree).some((t) => t.startsWith('/A/')))
+  assert.ok(byId('chip'))
+
+  sdk.host.focusedStoredSessionId = 'session-empty'
+  assert.equal(shownPath(renderPane(carded)), '')
+})
+
+test('the recent query is scoped to the chat and a foreign row from an unfiltered gateway is dropped', async () => {
+  const rows = [
+    { path: '/A/annotated.md', sidecarPath: '/h/a.json', openCount: 2, sessionId: 'session-A' },
+    { path: '/old/unscoped.md', sidecarPath: '/h/u.json', openCount: 1 },
+    { path: '/B/other.md', sidecarPath: '/h/b.json', openCount: 1, sessionId: 'session-B' },
+  ]
+  const { standalone } = await registerScoped({ recent: rows })
+  sdk.host.focusedStoredSessionId = 'session-A'
+  const tree = renderPane(standalone.render())
+  assert.equal(shownPath(tree), '/A/annotated.md', 'a backend row of this chat opens automatically')
+  assert.deepEqual(tabTitles(tree), [], 'a single document needs no tab strip')
+  assert.deepEqual(plugin.internals.sessionRows(rows, 'session-A').map((r) => r.path), ['/A/annotated.md'])
+  assert.deepEqual(plugin.internals.sessionRows(rows, ''), [])
+})
+
+test('opening a path records it under recent:<chat> and the chat documents, never the global recent list', async () => {
+  const { standalone, store, ctx } = await registerScoped()
+  sdk.host.focusedStoredSessionId = 'session-A'
+  const pane = standalone.render()
+  let tree = renderPane(pane)
+  const input = find(tree, (n) => n.type === sdk.Input)[0]
+  input.props.onChange({ target: { value: '/A/typed.md' } })
+  tree = renderPane(pane)
+  button(tree, 'open').props.onClick()
+  await flush()
+  assert.deepEqual(store.get('recent:session-A'), ['/A/typed.md'])
+  assert.equal(store.has('recent'), false, 'the global recent key is never written')
+  assert.deepEqual(plugin.internals.sessionFilesFor(ctx, 'session-A', []), ['/A/typed.md'])
+  assert.deepEqual(recentChips(renderPane(pane)), ['typed.md'])
+
+  sdk.host.focusedStoredSessionId = 'session-B'
+  assert.deepEqual(recentChips(renderPane(pane)), [], 'another chat does not see session-A recents')
+})
+
+test('saving annotations tags the sidecar with the chat in view', async () => {
+  const { standalone, calls, directive } = await registerScoped({ items: [item('a', 'open')] })
+  directive({ attrs: { file: '/A/doc1.md' }, sessionId: 'session-A' })
+  await flush()
+  sdk.host.focusedStoredSessionId = 'session-A'
+  const pane = standalone.render()
+  button(renderPane(pane), 'Resolve all').props.onClick()
+  const [url, options] = calls.at(-1)
+  assert.equal(url, '/annotations')
+  assert.equal(options.body.path, '/A/doc1.md')
+  assert.equal(options.body.sessionId, 'session-A')
+})

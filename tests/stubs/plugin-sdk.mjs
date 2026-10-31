@@ -12,6 +12,8 @@ export function __reset() {
   host.submissions.length = 0
   host.errors.length = 0
   host.focusedSessionId = 'test-session'
+  host.focusedStoredSessionId = ''
+  host.activeSessionId = ''
   host.submitResult = true
 }
 
@@ -27,9 +29,12 @@ export const Input = function Input() {}
 export const MessageTextContent = function MessageTextContent() {}
 export const Textarea = function Textarea() {}
 
-export const atom = (initial) => ({ initial, get: () => initial, set() {} })
+export const atom = (initial) => {
+  const box = { value: initial, get: () => box.value, set(next) { box.value = next } }
+  return box
+}
 export const queryClient = { setQueryData() {} }
-export const useValue = () => 0
+export const useValue = (source) => (source && source.get ? source.get() : 0)
 
 export const useQuery = ({ queryKey }) => ({
   data: query_results.get(queryKey[0]),
@@ -42,6 +47,8 @@ export const host = {
   submissions: [],
   errors: [],
   focusedSessionId: 'test-session',
+  focusedStoredSessionId: '',
+  activeSessionId: '',
   submitResult: true,
   notify() {},
   notifyError(message) { host.errors.push(message) },
@@ -49,7 +56,11 @@ export const host = {
     host.submissions.push({ sessionId, message })
     return host.submitResult
   } },
-  state: { focusedSessionId: { get: () => host.focusedSessionId } },
+  state: {
+    focusedSessionId: { get: () => host.focusedSessionId },
+    focusedStoredSessionId: { get: () => host.focusedStoredSessionId },
+    activeSessionId: { get: () => host.activeSessionId },
+  },
   openWorkspace(_id, options) {
     host.workspaces.push(options)
   },

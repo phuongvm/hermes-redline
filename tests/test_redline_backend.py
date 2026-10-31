@@ -392,3 +392,141 @@ def test_api_validation_limits_and_bad_sidecar(api, tmp_path):
     (tmp_path / "a.md.redline.json").write_text("{not json", encoding="utf-8")
     assert api.get("/annotations", params={"path": str(a)}).status_code == 500
     assert api.get("/doc", params={"path": str(tmp_path / "missing.md")}).status_code == 404
+
+
+# ------------------------------------------------------------------ session-scoped documents
+
+def _central(common, home, target, items, session_id=None):
+    sc = common.central_sidecar_path(Path(target), home)
+    common.write_sidecar_atomic(sc, items, target_file=target, storage="central", session_id=session_id)
+    return sc
+
+
+def test_session_manifest_path_is_stable_and_filesystem_safe(common, tmp_path):
+    p = common.session_manifest_path("sess/A:1", tmp_path)
+    assert p.parent == tmp_path / "redline" / "sessions" and p.name.endswith("-sess_A_1.json")
+    assert p == common.session_manifest_path("sess/A:1", tmp_path)
+    assert p != common.session_manifest_path("sess_A_1", tmp_path)  # sha16 keeps lookalikes apart
+
+
+def test_record_session_files_keeps_reviewable_existing_files_in_front_order(common, tmp_path):
+    home = tmp_path / "h"
+    a, b, c = _md(tmp_path / "a.md"), _md(tmp_path / "b.md"), _md(tmp_path / "c.py", "x = 1\n" * 20)
+    junk = tmp_path / "pic.png"
+    junk.write_bytes(b"\x89PNG")
+    readme = _md(tmp_path / "README.md")
+    assert common.record_session_files("s1", [a, b, junk, readme, tmp_path / "gone.md"], hermes_home=home) == [
+        str(a), str(b)]
+    merged = common.record_session_files("s1", [c, b], hermes_home=home)
+    assert merged == [str(c), str(b), str(a)]  # new files lead, no duplicates
+    manifest = json.loads(common.session_manifest_path("s1", home).read_text(encoding="utf-8"))
+    assert manifest["sessionId"] == "s1" and manifest["files"] == merged and manifest["updatedAt"]
+
+
+@pytest.mark.parametrize("sid", ["", "   ", "_", None])
+def test_record_session_files_ignores_unbound_sessions(common, tmp_path, sid):
+    f = _md(tmp_path / "a.md")
+    assert common.record_session_files(sid, [f], hermes_home=tmp_path / "h") == []
+    assert not (tmp_path / "h" / "redline" / "sessions").exists()
+
+
+def test_record_session_files_caps_manifest_at_32(common, tmp_path):
+    files = [_md(tmp_path / f"f{i}.md") for i in range(40)]
+    out = common.record_session_files("s", files, hermes_home=tmp_path / "h")
+    assert len(out) == 32 and out[0] == str(files[0])
+
+
+def test_read_session_files_reports_documents_before_any_annotation(common, tmp_path):
+    home = tmp_path / "h"
+    a, b = _md(tmp_path / "a.md"), _md(tmp_path / "b.md")
+    common.record_session_files("sA", [a, b], hermes_home=home)
+    rows = common.read_session_files("sA", hermes_home=home)
+    assert [Path(r["path"]).name for r in rows] == ["a.md", "b.md"]
+    assert all(r["sessionId"] == "sA" and r["openCount"] == 0 and r["sentCount"] == 0 and r["resolvedCount"] == 0
+               for r in rows)
+    _central(common, home, a, [{"status": "open"}, {"status": "resolved"}])
+    first = common.read_session_files("sA", hermes_home=home)[0]
+    assert first["openCount"] == 1 and first["resolvedCount"] == 1 and first["sidecarPath"]
+    b.unlink()
+    assert [Path(r["path"]).name for r in common.read_session_files("sA", hermes_home=home)] == ["a.md"]
+    assert common.read_session_files("other", hermes_home=home) == []
+
+
+def test_write_sidecar_atomic_tags_sessions_without_changing_format(common, tmp_path):
+    home = tmp_path / "h"
+    target = _md(tmp_path / "a.md")
+    sc = _central(common, home, target, [{"id": "1"}], session_id="sA")
+    data = json.loads(sc.read_text(encoding="utf-8"))
+    assert data["sessions"] == ["sA"] and data["items"] == [{"id": "1"}]
+    assert sc.read_text(encoding="utf-8") == json.dumps(data, ensure_ascii=False, indent=2)  # REDLINE-INV-2
+    _central(common, home, target, [{"id": "2"}], session_id="sB")
+    _central(common, home, target, [{"id": "3"}], session_id="sA")
+    _central(common, home, target, [{"id": "4"}])  # a save with no session keeps the owners
+    assert json.loads(sc.read_text(encoding="utf-8"))["sessions"] == ["sA", "sB"]
+    assert [Path(r["path"]).name for r in common.read_session_files("sA", hermes_home=home)] == ["a.md"]
+    bare = tmp_path / "x.md.redline.json"
+    common.write_sidecar_atomic(bare, [{"id": "9"}], target_file=target, storage="adjacent", session_id="sA")
+    assert json.loads(bare.read_text(encoding="utf-8")) == [{"id": "9"}]  # bare lists stay bare
+
+
+def test_list_recent_sidecars_session_filter_isolates_sessions(common, tmp_path):
+    home = tmp_path / "h"
+    legacy, a, b, ghost = (_md(tmp_path / n) for n in ("legacy.md", "a.md", "b.md", "ghost.md"))
+    _central(common, home, legacy, [{"status": "open"}])  # unscoped
+    _central(common, home, a, [{"status": "open"}], session_id="sA")
+    _central(common, home, b, [{"status": "sent"}], session_id="sB")
+    common.record_session_files("sA", [ghost], hermes_home=home)  # recorded, never annotated
+
+    assert {Path(r["path"]).name for r in common.list_recent_sidecars(home, limit=10)} == {"legacy.md", "a.md", "b.md"}
+    rows = common.list_recent_sidecars(home, limit=10, session_id="sA")
+    assert sorted(Path(r["path"]).name for r in rows) == ["a.md", "ghost.md"]
+    assert all(r["sessionId"] == "sA" for r in rows)
+    assert [r["openCount"] for r in rows if r["path"].endswith("a.md")] == [1]
+    assert [Path(r["path"]).name for r in common.list_recent_sidecars(home, session_id="sB")] == ["b.md"]
+    for blank in ("", "  ", "_", "nobody"):
+        assert common.list_recent_sidecars(home, session_id=blank) == []
+    assert len(common.list_recent_sidecars(home, limit=1, session_id="sA")) == 1
+
+
+def test_hooks_record_written_files_per_session(hooks, common, tmp_path, monkeypatch):
+    home = tmp_path / "h"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    a, b = _md(tmp_path / "a.md"), _md(tmp_path / "b.md")
+    readme = _md(tmp_path / "README.md")
+    _turn(hooks, "sA", a, readme)
+    _turn(hooks, "sB", b)
+    _turn(hooks, "", b)  # unbound turn records nothing
+    assert [Path(r["path"]).name for r in common.read_session_files("sA", hermes_home=home)] == ["a.md"]
+    assert [Path(r["path"]).name for r in common.read_session_files("sB", hermes_home=home)] == ["b.md"]
+
+
+def test_hooks_transform_records_bundle_and_top_level_directive_files(hooks, common, tmp_path, monkeypatch):
+    home = tmp_path / "h"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    a, b, c = (_md(tmp_path / n) for n in ("a.md", "b.md", "c.md"))
+    _turn(hooks, "sA", a, b)
+    hooks._transform_llm_output("done", session_id="sA", platform="desktop")
+    assert [Path(r["path"]).name for r in common.read_session_files("sA", hermes_home=home)] == ["a.md", "b.md"]
+
+    text = f'see ::redline{{file={json.dumps(str(c))}, file_1={json.dumps(str(a))}}}\n```\n::redline{{file="{b}"}}\n```'
+    assert hooks._transform_llm_output(text, session_id="sA", platform="desktop") is None
+    assert [Path(r["path"]).name for r in common.read_session_files("sA", hermes_home=home)] == ["c.md", "a.md", "b.md"]
+    assert common.read_session_files("sB", hermes_home=home) == []
+
+
+# ------------------------------------------------------------------ dashboard routes: session scope
+
+def test_api_post_annotations_tags_session_and_recent_filters_by_it(api, tmp_path, monkeypatch):
+    monkeypatch.setenv("REDLINE_SIDECAR_MODE", "central")
+    a, b, legacy = (_md(tmp_path / n) for n in ("a.md", "b.md", "legacy.md"))
+    item = [{"id": "x", "status": "open"}]
+    api.post("/annotations", json={"path": str(a), "items": item, "sessionId": "sA"})
+    api.post("/annotations", json={"path": str(b), "items": item, "session_id": "sB"})
+    api.post("/annotations", json={"path": str(legacy), "items": item})
+
+    assert len(api.get("/recent").json()["items"]) == 3  # no session_id: legacy behavior
+    rows = api.get("/recent", params={"session_id": "sA"}).json()["items"]
+    assert [Path(r["path"]).name for r in rows] == ["a.md"] and rows[0]["sessionId"] == "sA"
+    assert [Path(r["path"]).name for r in api.get("/recent", params={"session_id": "sB"}).json()["items"]] == ["b.md"]
+    assert api.get("/recent", params={"session_id": ""}).json()["items"] == []
+    assert api.get("/recent", params={"session_id": "session-empty"}).json()["items"] == []
